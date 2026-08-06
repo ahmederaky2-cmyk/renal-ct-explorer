@@ -8,6 +8,7 @@ from renal_explorer.labels import CanonicalLabel
 from renal_explorer.models import VolumeCase
 from renal_explorer.remote_data import RemoteDataError, ensure_demo_case, remote_urls
 from renal_explorer.rendering import render_view
+from renal_explorer.three_d import candidate_vessel_mesh, surface_mesh
 
 
 def synthetic_case(segmentation: np.ndarray) -> VolumeCase:
@@ -77,6 +78,37 @@ def test_rendering_handles_last_slice_and_anisotropic_spacing() -> None:
     assert view.ndim == 3
     assert view.shape[2] == 3
     assert view.dtype == np.uint8
+
+
+def test_3d_surface_uses_physical_coordinates() -> None:
+    segmentation = np.zeros((10, 9, 8), dtype=np.uint8)
+    segmentation[2:6, 2:7, 2:6] = int(CanonicalLabel.KIDNEY)
+    case = synthetic_case(segmentation)
+    mesh = surface_mesh(
+        case.segmentation,
+        case.affine,
+        int(CanonicalLabel.KIDNEY),
+        step_size=1,
+    )
+
+    assert mesh is not None
+    assert mesh["vertices"].shape[1] == 3
+    assert mesh["faces"].shape[1] == 3
+    assert mesh["faces"].shape[0] > 0
+    assert np.isclose(mesh["vertices"][:, 0].min(), 3.0)
+    assert np.isclose(mesh["vertices"][:, 0].max(), 11.0)
+
+
+def test_candidate_vessels_require_a_renal_roi() -> None:
+    segmentation = np.zeros((12, 12, 12), dtype=np.uint8)
+    case = synthetic_case(segmentation)
+    mesh = candidate_vessel_mesh(
+        case.image,
+        case.segmentation,
+        case.affine,
+        case.spacing,
+    )
+    assert mesh is None
 
 
 def test_case_directory_discovery(tmp_path: Path) -> None:

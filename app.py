@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 st.set_page_config(
@@ -17,7 +18,7 @@ st.set_page_config(
 
 from renal_explorer.analysis import analyze_case, histogram_table  # noqa: E402
 from renal_explorer.datasets import DATASETS, DatasetError, get_adapter  # noqa: E402
-from renal_explorer.labels import LABEL_NAMES, CanonicalLabel  # noqa: E402
+from renal_explorer.labels import LABEL_COLORS, LABEL_NAMES, CanonicalLabel  # noqa: E402
 from renal_explorer.models import CaseFiles  # noqa: E402
 from renal_explorer.remote_data import (  # noqa: E402
     RemoteDataError,
@@ -30,6 +31,10 @@ from renal_explorer.rendering import (  # noqa: E402
     legend_html,
     render_view,
 )
+from renal_explorer.three_d import (  # noqa: E402
+    candidate_vessel_mesh,
+    surface_mesh,
+)
 
 WINDOW_PRESETS = {
     "Abdomen": (60, 360),
@@ -38,6 +43,17 @@ WINDOW_PRESETS = {
     "Liver": (30, 150),
     "Bone": (400, 1800),
     "Lung": (-600, 1500),
+}
+
+SURFACE_STEPS = {"Fast": 3, "Balanced": 2, "Detailed": 1}
+LABEL_OPACITY = {
+    CanonicalLabel.KIDNEY: 0.32,
+    CanonicalLabel.TUMOR: 0.95,
+    CanonicalLabel.CYST: 0.72,
+    CanonicalLabel.RENAL_ARTERY: 0.95,
+    CanonicalLabel.RENAL_VEIN: 0.90,
+    CanonicalLabel.AORTA: 0.65,
+    CanonicalLabel.IVC: 0.65,
 }
 
 
@@ -93,6 +109,106 @@ def load_case_bundle(
     )
     case = adapter.load_case(files)
     return case, analyze_case(case)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def cached_label_surface(
+    dataset_key: str,
+    case_id: str,
+    segmentation_signature: tuple[int, int] | None,
+    label_value: int,
+    step_size: int,
+    _segmentation: np.ndarray,
+    _affine: np.ndarray,
+):
+    del dataset_key, case_id, segmentation_signature
+    return surface_mesh(_segmentation, _affine, label_value, step_size)
+
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def cached_candidate_vessels(
+    dataset_key: str,
+    case_id: str,
+    image_signature: tuple[int, int],
+    segmentation_signature: tuple[int, int] | None,
+    sensitivity: str,
+    detail: str,
+    _image: np.ndarray,
+    _segmentation: np.ndarray,
+    _affine: np.ndarray,
+    _spacing: tuple[float, float, float],
+):
+    del dataset_key, case_id, image_signature, segmentation_signature
+    return candidate_vessel_mesh(
+        _image,
+        _segmentation,
+        _affine,
+        _spacing,
+        sensitivity=sensitivity,
+        detail=detail,
+    )
+
+
+def build_3d_figure(
+    label_meshes: list[tuple[CanonicalLabel, dict]],
+    vessel_candidates: dict | None,
+) -> go.Figure:
+    figure = go.Figure()
+    for label, mesh in label_meshes:
+        vertices = mesh["vertices"]
+        faces = mesh["faces"]
+        red, green, blue = LABEL_COLORS[label]
+        figure.add_trace(
+            go.Mesh3d(
+                x=vertices[:, 0],
+                y=vertices[:, 1],
+                z=vertices[:, 2],
+                i=faces[:, 0],
+                j=faces[:, 1],
+                k=faces[:, 2],
+                name=LABEL_NAMES[label],
+                color=f"rgb({red},{green},{blue})",
+                opacity=LABEL_OPACITY[label],
+                flatshading=False,
+                lighting={"ambient": 0.55, "diffuse": 0.75, "specular": 0.25},
+                hovertemplate=f"{LABEL_NAMES[label]}<extra></extra>",
+            )
+        )
+
+    if vessel_candidates is not None:
+        vertices = vessel_candidates["vertices"]
+        faces = vessel_candidates["faces"]
+        figure.add_trace(
+            go.Mesh3d(
+                x=vertices[:, 0],
+                y=vertices[:, 1],
+                z=vertices[:, 2],
+                i=faces[:, 0],
+                j=faces[:, 1],
+                k=faces[:, 2],
+                name="Candidate vessels (experimental)",
+                color="rgb(0,225,255)",
+                opacity=0.88,
+                flatshading=False,
+                lighting={"ambient": 0.45, "diffuse": 0.85, "specular": 0.5},
+                hovertemplate="Candidate vessel<extra></extra>",
+            )
+        )
+
+    figure.update_layout(
+        height=720,
+        margin={"l": 0, "r": 0, "t": 35, "b": 0},
+        legend={"orientation": "h", "y": 1.02, "x": 0.0},
+        scene={
+            "aspectmode": "data",
+            "xaxis_title": "Right ↔ Left (mm)",
+            "yaxis_title": "Anterior ↔ Posterior (mm)",
+            "zaxis_title": "Inferior ↔ Superior (mm)",
+            "camera": {"eye": {"x": 1.45, "y": 1.45, "z": 1.1}},
+        },
+        uirevision="renal-3d",
+    )
+    return figure
 
 
 def file_signature(path: str) -> tuple[int, int] | None:
@@ -368,8 +484,8 @@ def main() -> None:
     if visible_labels and overlay_mode != "Off":
         st.markdown(legend_html(visible_labels), unsafe_allow_html=True)
 
-    tab_measurements, tab_histogram, tab_export, tab_source = st.tabs(
-        ["Measurements", "HU histogram", "Export", "Source"]
+    tab_measurements, tab_3d, tab_histogram, tab_export, tab_source = st.tabs(
+        ["Measurements", "Interactive 3D", "HU histogram", "Export", "Source"]
     )
     with tab_measurements:
         if not regions:
@@ -409,6 +525,115 @@ def main() -> None:
             "Laterality is derived from connected components after canonical RAS orientation. "
             "Measurements are research outputs and are not clinically validated."
         )
+
+    with tab_3d:
+        if case.segmentation is None:
+            st.info("A segmentation is required to build the 3D surface model.")
+        else:
+            control_columns = st.columns(3)
+            with control_columns[0]:
+                detail = st.selectbox(
+                    "3D detail",
+                    list(SURFACE_STEPS),
+                    index=1,
+                    help="Balanced is recommended for free hosting.",
+                )
+            has_renal_vessel_labels = any(
+                label in available_labels
+                for label in (CanonicalLabel.RENAL_ARTERY, CanonicalLabel.RENAL_VEIN)
+            )
+            with control_columns[1]:
+                include_candidates = st.checkbox(
+                    "Estimate unlabeled vessels",
+                    value=not has_renal_vessel_labels,
+                    help=(
+                        "Uses a Frangi tubular-structure filter near the kidneys when the "
+                        "dataset does not provide vessel annotations."
+                    ),
+                )
+            with control_columns[2]:
+                vessel_sensitivity = st.selectbox(
+                    "Vessel sensitivity",
+                    ("Strict", "Balanced", "Sensitive"),
+                    index=1,
+                    disabled=not include_candidates,
+                )
+
+            label_key = "-".join(str(int(label)) for label in visible_labels) or "none"
+            build_key = (
+                f"three_d_ready_{dataset_key}_{case_id}_{detail}_{label_key}_"
+                f"{include_candidates}_{vessel_sensitivity}"
+            )
+            if st.button(
+                "Build interactive 3D",
+                key=f"build_{build_key}",
+                type="primary",
+                width="stretch",
+            ):
+                st.session_state[build_key] = True
+
+            if not st.session_state.get(build_key, False):
+                st.info(
+                    "Build the rotatable physical-coordinate model when needed. "
+                    "It is generated on the server and cached for later visitors."
+                )
+            else:
+                with st.spinner("Building 3D surfaces and vessel candidates…"):
+                    label_meshes = []
+                    for label in visible_labels:
+                        mesh = cached_label_surface(
+                            dataset_key,
+                            case_id,
+                            file_signature(segmentation_path),
+                            int(label),
+                            SURFACE_STEPS[detail],
+                            case.segmentation,
+                            case.affine,
+                        )
+                        if mesh is not None:
+                            label_meshes.append((label, mesh))
+
+                    vessel_candidates = None
+                    if include_candidates:
+                        vessel_candidates = cached_candidate_vessels(
+                            dataset_key,
+                            case_id,
+                            file_signature(image_path),
+                            file_signature(segmentation_path),
+                            vessel_sensitivity,
+                            detail,
+                            case.image,
+                            case.segmentation,
+                            case.affine,
+                            case.spacing,
+                        )
+
+                if not label_meshes and vessel_candidates is None:
+                    st.warning("No surface could be generated with the current selections.")
+                else:
+                    figure = build_3d_figure(label_meshes, vessel_candidates)
+                    st.plotly_chart(
+                        figure,
+                        config={"displaylogo": False, "scrollZoom": True},
+                    )
+                    triangle_count = sum(
+                        int(mesh["faces"].shape[0]) for _label, mesh in label_meshes
+                    )
+                    if vessel_candidates is not None:
+                        triangle_count += int(vessel_candidates["faces"].shape[0])
+                    st.caption(f"Rendered {triangle_count:,} surface triangles in RAS millimetres.")
+
+            if has_renal_vessel_labels:
+                st.success(
+                    "This case contains mapped renal artery/vein annotations; they are "
+                    "rendered directly when selected in Structures."
+                )
+            else:
+                st.warning(
+                    "This dataset has no renal vessel labels. Cyan structures are Frangi "
+                    "candidate vessels only: they are not validated and cannot distinguish "
+                    "arteries from veins. Use KiPA22 for labeled renal artery/vein surfaces."
+                )
 
     with tab_histogram:
         histogram = pd.DataFrame(histogram_table(case)).set_index("HU")

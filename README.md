@@ -22,11 +22,19 @@ This is research software. It is not a medical device and must not be used for d
 - Calculates volumes and distances in physical coordinates.
 - Separates kidney and tumor connected components and derives research-only laterality.
 - Preserves physical aspect ratios in coronal and sagittal views.
+- Builds rotatable physical-coordinate 3D surfaces for mapped organs and vessels.
+- Adds an explicitly experimental Frangi candidate-vessel surface for datasets such as
+  KiTS23 that do not provide renal vessel annotations.
 - Keeps CT volumes in a shared server cache rather than Streamlit session state.
 - Exports JSON and CSV through browser downloads.
 - Provides a container configuration for online deployment.
 - Provides an on-demand, three-case KiTS23 catalogue for free Streamlit hosting.
 - Limits the in-memory case cache to one entry for free-tier stability.
+
+The **Interactive 3D** tab is generated on demand. True renal artery and vein surfaces are
+shown when a dataset supplies those labels (for example KiPA22). KiTS23 does not include
+renal vessel annotations, so its optional cyan vessel layer is an image-derived research
+candidate only and does not classify arteries versus veins.
 
 ## Supported labels
 
