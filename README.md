@@ -4,6 +4,8 @@ A cloud-ready, multi-dataset Streamlit viewer for renal CT research. The applica
 loading, normalization, measurement, windowing, and rendering on the server; a user's device
 only receives the rendered interface and compact result tables.
 
+**Live app:** https://renal-ct-explorer-9jxxrehbetm5lbbqffkjui.streamlit.app/
+
 The default **Online demo** mode downloads only the selected public KiTS23 image from the
 official Hugging Face repository and its segmentation from the official GitHub repository.
 No dataset installation or local path is required for visitors.
