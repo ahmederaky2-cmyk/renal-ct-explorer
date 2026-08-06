@@ -22,9 +22,11 @@ This is research software. It is not a medical device and must not be used for d
 - Calculates volumes and distances in physical coordinates.
 - Separates kidney and tumor connected components and derives research-only laterality.
 - Preserves physical aspect ratios in coronal and sagittal views.
-- Builds rotatable physical-coordinate 3D surfaces for mapped organs and vessels.
-- Adds an explicitly experimental Frangi candidate-vessel surface for datasets such as
-  KiTS23 that do not provide renal vessel annotations.
+- Builds rotatable physical-coordinate 3D surfaces with isotropic signed-distance
+  reconstruction, volume-calibrated contouring, non-shrinking smoothing, topology-preserving
+  decimation, and an on-screen mesh quality report.
+- Adds an explicitly experimental Frangi/Sato connectivity-filtered candidate-vessel surface
+  and centerline layer for datasets such as KiTS23 that do not provide vessel annotations.
 - Keeps CT volumes in a shared server cache rather than Streamlit session state.
 - Exports JSON and CSV through browser downloads.
 - Provides a container configuration for online deployment.
@@ -35,6 +37,67 @@ The **Interactive 3D** tab is generated on demand. True renal artery and vein su
 shown when a dataset supplies those labels (for example KiPA22). KiTS23 does not include
 renal vessel annotations, so its optional cyan vessel layer is an image-derived research
 candidate only and does not classify arteries versus veins.
+
+## 3D quality architecture
+
+The 3D pipeline is designed around measurable geometric fidelity, not only a smooth-looking
+screenshot:
+
+1. Each label is cropped with a physical-space border and converted to a signed-distance
+   field using the NIfTI voxel spacing.
+2. The field is resampled isotropically. Small structures automatically receive a finer
+   target grid so lesions and cysts are not sacrificed for whole-organ speed.
+3. Lewiner marching cubes extracts a topologically correct surface. The iso-level is
+   calibrated in millimetres against the source label volume before smoothing.
+4. VTK windowed-sinc smoothing uses the same non-shrinking family and parameter mapping as
+   3D Slicer's closed-surface conversion. Smoothing is reduced automatically if its 95th
+   percentile displacement or volume error exceeds the selected quality profile.
+5. Topology-preserving decimation is accepted only when the surface remains watertight and
+   does not worsen volume error by more than one percentage point.
+6. The app reports triangles, source-to-mesh volume error, surface area, smoothing
+   displacement, mesh spacing, and watertight status for every generated structure.
+
+For unlabeled vessels, the app combines physical-scale Frangi and Sato responses, dual
+threshold connectivity, renal-proximity and component filtering, a volume-calibrated mesh,
+and a skeleton centerline. This is a stronger visualization heuristic than a single global
+Frangi threshold, but it remains a candidate layer—not an artery/vein segmentation.
+
+### Release quality gates
+
+For the recommended **Balanced** profile, labeled structures must have zero boundary,
+non-manifold, and degenerate edges; organ/tumor volume error should remain at or below 3%;
+small structures may use up to 6%; and smoothing displacement p95 must remain at or below
+0.9 mm. Experimental vessel candidates use an 8% volume-fidelity limit because the source
+mask itself is image-derived.
+
+On public KiTS23 `case_00015`, the current Balanced build produced these reproducible smoke
+benchmark results on the development machine:
+
+| Structure | Triangles | Volume error | Smooth p95 | Watertight |
+|---|---:|---:|---:|:---:|
+| Kidney | 120,000 | 0.02% | 0.53 mm | Yes |
+| Tumor | 10,678 | 1.14% | 0.57 mm | Yes |
+| Cyst | 6,716 | 0.13% | 0.43 mm | Yes |
+| Candidate vessels | 7,352 | 7.24% | 0.55 mm | Yes |
+
+The labeled surfaces completed in about 2.0 seconds and the full build including the
+CPU-intensive experimental vessel pass in about 15.6 seconds. Hosting hardware and case size
+will change those timings. The previous coarse implementation had 15.04% cyst volume error on
+the same case; the new result is 0.13%.
+
+These checks support a defensible quality claim for this web workflow, not a universal claim
+that it outperforms every desktop medical workstation or a clinical validation study. A fair
+competitor comparison must use the same source labelmaps, target triangle budgets, and
+surface-distance/volume/topology metrics.
+
+### Public methods studied
+
+- [3D Slicer closed-surface conversion](https://github.com/Slicer/Slicer/blob/c3467ecd3f8d617b2ef8b6ee469c6da2436c748c/Libs/vtkSegmentationCore/vtkBinaryLabelmapToClosedSurfaceConversionRule.cxx)
+- [VTK windowed-sinc smoothing](https://vtk.org/doc/nightly/html/classvtkWindowedSincPolyDataFilter.html)
+- [VTK discrete flying edges](https://vtk.org/doc/nightly/html/classvtkDiscreteFlyingEdges3D.html)
+- [VTK SurfaceNets3D](https://vtk.org/doc/nightly/html/classvtkSurfaceNets3D.html)
+- [scikit-image Lewiner marching cubes](https://scikit-image.org/docs/stable/api/skimage.measure.html)
+- [VMTK vascular modeling toolkit](https://vmtk.github.io/documentation/getting-started.html)
 
 ## Supported labels
 

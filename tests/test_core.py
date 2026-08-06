@@ -87,16 +87,38 @@ def test_3d_surface_uses_physical_coordinates() -> None:
     mesh = surface_mesh(
         case.segmentation,
         case.affine,
+        case.spacing,
         int(CanonicalLabel.KIDNEY),
-        step_size=1,
+        quality="Balanced",
     )
 
     assert mesh is not None
     assert mesh["vertices"].shape[1] == 3
     assert mesh["faces"].shape[1] == 3
     assert mesh["faces"].shape[0] > 0
-    assert np.isclose(mesh["vertices"][:, 0].min(), 3.0)
-    assert np.isclose(mesh["vertices"][:, 0].max(), 11.0)
+    assert np.all(np.isfinite(mesh["vertices"]))
+    assert np.ptp(mesh["vertices"][:, 0]) > np.ptp(mesh["vertices"][:, 1])
+    assert mesh["quality"]["watertight"] is True
+    assert mesh["quality"]["degenerate_triangles"] == 0
+    assert mesh["quality"]["volume_error_pct"] <= 6.0
+    assert mesh["quality"]["target_spacing_mm"] == 0.75
+
+
+def test_labeled_vessel_surface_includes_centerline() -> None:
+    segmentation = np.zeros((24, 18, 16), dtype=np.uint8)
+    segmentation[4:20, 8:11, 7:10] = int(CanonicalLabel.RENAL_ARTERY)
+    case = synthetic_case(segmentation)
+    mesh = surface_mesh(
+        case.segmentation,
+        case.affine,
+        case.spacing,
+        int(CanonicalLabel.RENAL_ARTERY),
+        quality="Balanced",
+    )
+
+    assert mesh is not None
+    assert mesh["centerline_points"] is not None
+    assert mesh["centerline_points"].shape[1] == 3
 
 
 def test_candidate_vessels_require_a_renal_roi() -> None:

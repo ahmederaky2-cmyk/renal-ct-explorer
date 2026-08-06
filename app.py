@@ -45,7 +45,7 @@ WINDOW_PRESETS = {
     "Lung": (-600, 1500),
 }
 
-SURFACE_STEPS = {"Fast": 3, "Balanced": 2, "Detailed": 1}
+SURFACE_QUALITIES = ("Fast", "Balanced", "Detailed")
 LABEL_OPACITY = {
     CanonicalLabel.KIDNEY: 0.32,
     CanonicalLabel.TUMOR: 0.95,
@@ -117,12 +117,13 @@ def cached_label_surface(
     case_id: str,
     segmentation_signature: tuple[int, int] | None,
     label_value: int,
-    step_size: int,
+    quality: str,
     _segmentation: np.ndarray,
     _affine: np.ndarray,
+    _spacing: tuple[float, float, float],
 ):
     del dataset_key, case_id, segmentation_signature
-    return surface_mesh(_segmentation, _affine, label_value, step_size)
+    return surface_mesh(_segmentation, _affine, _spacing, label_value, quality)
 
 
 @st.cache_data(show_spinner=False, max_entries=3)
@@ -154,6 +155,24 @@ def build_3d_figure(
     vessel_candidates: dict | None,
 ) -> go.Figure:
     figure = go.Figure()
+
+    def add_centerline(mesh: dict, name: str, color: str) -> None:
+        points = mesh.get("centerline_points")
+        if points is None or len(points) == 0:
+            return
+        figure.add_trace(
+            go.Scatter3d(
+                x=points[:, 0],
+                y=points[:, 1],
+                z=points[:, 2],
+                mode="lines",
+                name=f"{name} centerline",
+                line={"color": color, "width": 4},
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
     for label, mesh in label_meshes:
         vertices = mesh["vertices"]
         faces = mesh["faces"]
@@ -174,6 +193,7 @@ def build_3d_figure(
                 hovertemplate=f"{LABEL_NAMES[label]}<extra></extra>",
             )
         )
+        add_centerline(mesh, LABEL_NAMES[label], "rgba(255,255,255,0.88)")
 
     if vessel_candidates is not None:
         vertices = vessel_candidates["vertices"]
@@ -193,6 +213,11 @@ def build_3d_figure(
                 lighting={"ambient": 0.45, "diffuse": 0.85, "specular": 0.5},
                 hovertemplate="Candidate vessel<extra></extra>",
             )
+        )
+        add_centerline(
+            vessel_candidates,
+            "Candidate vessel",
+            "rgba(255,255,255,0.82)",
         )
 
     figure.update_layout(
@@ -534,7 +559,7 @@ def main() -> None:
             with control_columns[0]:
                 detail = st.selectbox(
                     "3D detail",
-                    list(SURFACE_STEPS),
+                    SURFACE_QUALITIES,
                     index=1,
                     help="Balanced is recommended for free hosting.",
                 )
@@ -547,8 +572,9 @@ def main() -> None:
                     "Estimate unlabeled vessels",
                     value=not has_renal_vessel_labels,
                     help=(
-                        "Uses a Frangi tubular-structure filter near the kidneys when the "
-                        "dataset does not provide vessel annotations."
+                        "Fuses physical-scale Frangi and Sato vesselness, connectivity, "
+                        "component filtering, and centerline extraction when annotations "
+                        "are unavailable."
                     ),
                 )
             with control_columns[2]:
@@ -586,9 +612,10 @@ def main() -> None:
                             case_id,
                             file_signature(segmentation_path),
                             int(label),
-                            SURFACE_STEPS[detail],
+                            detail,
                             case.segmentation,
                             case.affine,
+                            case.spacing,
                         )
                         if mesh is not None:
                             label_meshes.append((label, mesh))
@@ -623,6 +650,51 @@ def main() -> None:
                         triangle_count += int(vessel_candidates["faces"].shape[0])
                     st.caption(f"Rendered {triangle_count:,} surface triangles in RAS millimetres.")
 
+                    quality_rows = []
+                    for label, mesh in label_meshes:
+                        quality = mesh["quality"]
+                        quality_rows.append(
+                            {
+                                "Structure": LABEL_NAMES[label],
+                                "Triangles": quality["triangles"],
+                                "Volume error": f"{quality['volume_error_pct']:.2f}%",
+                                "Surface area": f"{quality['surface_area_cm2']:.1f} cm²",
+                                "Smooth p95": (
+                                    f"{quality['smoothing_displacement_p95_mm']:.2f} mm"
+                                ),
+                                "Mesh spacing": f"{quality['target_spacing_mm']:.2f} mm",
+                                "Watertight": "Yes" if quality["watertight"] else "No",
+                                "Components": "—",
+                            }
+                        )
+                    if vessel_candidates is not None:
+                        quality = vessel_candidates["quality"]
+                        quality_rows.append(
+                            {
+                                "Structure": "Candidate vessels",
+                                "Triangles": quality["triangles"],
+                                "Volume error": f"{quality['volume_error_pct']:.2f}%",
+                                "Surface area": f"{quality['surface_area_cm2']:.1f} cm²",
+                                "Smooth p95": (
+                                    f"{quality['smoothing_displacement_p95_mm']:.2f} mm"
+                                ),
+                                "Mesh spacing": f"{quality['target_spacing_mm']:.2f} mm",
+                                "Watertight": "Yes" if quality["watertight"] else "No",
+                                "Components": str(quality["candidate_components"]),
+                            }
+                        )
+                    with st.expander("3D quality report", expanded=True):
+                        st.dataframe(
+                            pd.DataFrame(quality_rows),
+                            hide_index=True,
+                            width="stretch",
+                        )
+                        st.caption(
+                            "Volume is checked against the source labelmap; smoothing is "
+                            "limited by physical displacement and volume error. Watertight "
+                            "requires zero boundary, non-manifold, and degenerate edges."
+                        )
+
             if has_renal_vessel_labels:
                 st.success(
                     "This case contains mapped renal artery/vein annotations; they are "
@@ -630,8 +702,9 @@ def main() -> None:
                 )
             else:
                 st.warning(
-                    "This dataset has no renal vessel labels. Cyan structures are Frangi "
-                    "candidate vessels only: they are not validated and cannot distinguish "
+                    "This dataset has no renal vessel labels. Cyan structures are "
+                    "Frangi/Sato connectivity-filtered candidates only: they are not "
+                    "validated and cannot distinguish "
                     "arteries from veins. Use KiPA22 for labeled renal artery/vein surfaces."
                 )
 
