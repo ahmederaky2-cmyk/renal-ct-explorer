@@ -3,6 +3,20 @@
 This folder contains the reproducible training and export path for the application's real
 renal artery/vein model. It intentionally does not contain KiPA22 data or trained weights.
 
+## No-training-data route: published BA-Net checkpoint
+
+If you do not have authorized KiPA22 training data, open
+[`notebooks/ba_net_single_fold_inference.ipynb`](../notebooks/ba_net_single_fold_inference.ipynb)
+in Google Colab. It runs one fold from the authors' public Zenodo checkpoint and produces a
+small prediction ZIP for the Streamlit uploader. It reads the remote ZIP index and retrieves
+only the requested BA-Net members (roughly 355 MB compressed), rather than downloading the
+full 3.7 GB BA-Net + ResUNet ensemble.
+
+This is pretrained inference, not retraining or validation. The output package is accepted
+only when its case ID, exact CT SHA-256, canonical shape, affine, label set, and research-only
+provenance match the selected case. BA-Net was trained on cropped KiPA22 CTA, so results on
+KiTS23 and other contrast phases remain an unvalidated domain transfer.
+
 ## Why KiPA22
 
 KiPA22 is CTA data with expert labels for renal vein, kidney, renal artery, and kidney tumor.

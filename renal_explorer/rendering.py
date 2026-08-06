@@ -92,6 +92,7 @@ def render_view(
     overlay_mode: str,
     opacity: float,
     linked_indices: dict[str, int] | None = None,
+    supplemental_segmentation: np.ndarray | None = None,
 ) -> np.ndarray:
     image_plane = _extract_plane(image, orientation, index)
     segmentation_plane = (
@@ -107,18 +108,36 @@ def render_view(
     gray = apply_ct_window(image_plane, level, width)
     rgb = np.repeat(gray[..., np.newaxis], 3, axis=2)
 
-    if segmentation_plane is not None and overlay_mode != "Off":
-        for label in visible_labels:
-            mask = segmentation_plane == int(label)
-            if not np.any(mask):
+    supplemental_plane = None
+    if supplemental_segmentation is not None:
+        supplemental_plane = _extract_plane(
+            supplemental_segmentation,
+            orientation,
+            index,
+        )
+        if not np.allclose(scale, 1.0, atol=0.01):
+            supplemental_plane = ndi.zoom(
+                supplemental_plane,
+                zoom=scale,
+                order=0,
+                prefilter=False,
+            )
+
+    if overlay_mode != "Off":
+        for overlay in (segmentation_plane, supplemental_plane):
+            if overlay is None:
                 continue
-            if overlay_mode == "Outline":
-                mask = mask & ~ndi.binary_erosion(mask)
-                rgb[mask] = np.asarray(LABEL_COLORS[label], dtype=np.uint8)
-            else:
-                color = np.asarray(LABEL_COLORS[label], dtype=float)
-                blended = rgb[mask].astype(float) * (1.0 - opacity) + color * opacity
-                rgb[mask] = np.clip(blended, 0, 255).astype(np.uint8)
+            for label in visible_labels:
+                mask = overlay == int(label)
+                if not np.any(mask):
+                    continue
+                if overlay_mode == "Outline":
+                    mask = mask & ~ndi.binary_erosion(mask)
+                    rgb[mask] = np.asarray(LABEL_COLORS[label], dtype=np.uint8)
+                else:
+                    color = np.asarray(LABEL_COLORS[label], dtype=float)
+                    blended = rgb[mask].astype(float) * (1.0 - opacity) + color * opacity
+                    rgb[mask] = np.clip(blended, 0, 255).astype(np.uint8)
 
     if linked_indices is not None:
         row, column = _crosshair_position(orientation, linked_indices, image.shape)

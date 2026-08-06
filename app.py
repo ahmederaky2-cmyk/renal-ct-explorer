@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from datetime import datetime, timezone
@@ -20,6 +21,10 @@ from renal_explorer.analysis import analyze_case, histogram_table  # noqa: E402
 from renal_explorer.datasets import DATASETS, DatasetError, get_adapter  # noqa: E402
 from renal_explorer.labels import LABEL_COLORS, LABEL_NAMES, CanonicalLabel  # noqa: E402
 from renal_explorer.models import CaseFiles  # noqa: E402
+from renal_explorer.prediction_packages import (  # noqa: E402
+    PredictionPackageError,
+    load_banet_prediction_package,
+)
 from renal_explorer.remote_data import (  # noqa: E402
     RemoteDataError,
     demo_case_ids,
@@ -39,6 +44,7 @@ from renal_explorer.vessel_ml import (  # noqa: E402
     VesselModelError,
     predict_vessels,
     resolve_model_bundle,
+    sha256_file,
 )
 
 WINDOW_PRESETS = {
@@ -51,6 +57,10 @@ WINDOW_PRESETS = {
 }
 
 SURFACE_QUALITIES = ("Fast", "Balanced", "Detailed")
+COLAB_NOTEBOOK_URL = (
+    "https://colab.research.google.com/github/ahmederaky2-cmyk/renal-ct-explorer/"
+    "blob/main/notebooks/ba_net_single_fold_inference.ipynb"
+)
 LABEL_OPACITY = {
     CanonicalLabel.KIDNEY: 0.32,
     CanonicalLabel.TUMOR: 0.95,
@@ -120,7 +130,7 @@ def load_case_bundle(
 def cached_label_surface(
     dataset_key: str,
     case_id: str,
-    segmentation_signature: tuple[int, int] | None,
+    segmentation_signature: str,
     label_value: int,
     quality: str,
     _segmentation: np.ndarray,
@@ -136,7 +146,7 @@ def cached_candidate_vessels(
     dataset_key: str,
     case_id: str,
     image_signature: tuple[int, int],
-    segmentation_signature: tuple[int, int] | None,
+    segmentation_signature: str,
     sensitivity: str,
     detail: str,
     _image: np.ndarray,
@@ -171,7 +181,7 @@ def cached_ml_vessels(
     dataset_key: str,
     case_id: str,
     image_signature: tuple[int, int],
-    segmentation_signature: tuple[int, int] | None,
+    segmentation_signature: str,
     model_sha256: str,
     _image: np.ndarray,
     _segmentation: np.ndarray | None,
@@ -190,6 +200,32 @@ def cached_ml_vessels(
         _spacing,
         _segmentation,
         _bundle,
+    )
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def cached_file_sha256(path: str, signature: tuple[int, int]) -> str:
+    del signature
+    return sha256_file(Path(path))
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def cached_prediction_package(
+    package_sha256: str,
+    expected_case_id: str,
+    expected_shape: tuple[int, int, int],
+    expected_affine_values: tuple[float, ...],
+    expected_image_sha256: str,
+    _payload: bytes,
+):
+    del package_sha256
+    affine = np.asarray(expected_affine_values, dtype=float).reshape(4, 4)
+    return load_banet_prediction_package(
+        _payload,
+        expected_case_id,
+        expected_shape,
+        affine,
+        expected_image_sha256,
     )
 
 
@@ -423,14 +459,86 @@ def main() -> None:
         st.error(f"The case could not be loaded: {exc}")
         st.stop()
 
-    available_labels: list[CanonicalLabel] = []
+    source_available_labels: list[CanonicalLabel] = []
     if case.segmentation is not None:
         present = set(int(value) for value in np.unique(case.segmentation))
+        source_available_labels = [
+            label
+            for label in CanonicalLabel
+            if label != CanonicalLabel.BACKGROUND and int(label) in present
+        ]
+
+    source_has_renal_vessels = any(
+        label in source_available_labels
+        for label in (CanonicalLabel.RENAL_ARTERY, CanonicalLabel.RENAL_VEIN)
+    )
+    imported_prediction = None
+    with st.sidebar:
+        st.divider()
+        with st.expander("Vessel ML prediction", expanded=False):
+            st.markdown(f"[Open the free BA-Net Colab workflow]({COLAB_NOTEBOOK_URL})")
+            st.caption(
+                "Colab runs the published fold-0 checkpoint. Upload its result package "
+                "here; the CT hash and geometry are verified before display."
+            )
+            prediction_upload = st.file_uploader(
+                "BA-Net result (.zip)",
+                type=("zip",),
+                key=f"banet_prediction_{dataset_key}_{case_id}",
+                disabled=source_has_renal_vessels,
+                help="Use the ZIP downloaded by the linked notebook.",
+            )
+            if source_has_renal_vessels:
+                st.info("This case already contains renal artery/vein annotations.")
+            elif prediction_upload is not None:
+                try:
+                    prediction_payload = prediction_upload.getvalue()
+                    package_digest = hashlib.sha256(prediction_payload).hexdigest()
+                    image_signature = file_signature(image_path)
+                    if image_signature is None:
+                        raise PredictionPackageError("The selected CT file is unavailable.")
+                    with st.spinner("Checking prediction identity and geometry…"):
+                        image_digest = cached_file_sha256(image_path, image_signature)
+                        imported_prediction = cached_prediction_package(
+                            package_digest,
+                            case_id,
+                            tuple(int(value) for value in case.image.shape),
+                            tuple(float(value) for value in case.affine.ravel()),
+                            image_digest,
+                            prediction_payload,
+                        )
+                    provenance = imported_prediction.provenance
+                    st.success(
+                        "Verified BA-Net prediction · "
+                        f"fold {provenance['model']['fold']} · "
+                        f"artery {provenance['artery_voxels']:,} voxels · "
+                        f"vein {provenance['vein_voxels']:,} voxels"
+                    )
+                    st.warning(
+                        "Research-only prediction. BA-Net was trained on cropped KiPA22 CTA; "
+                        "other CT phases are out of domain."
+                    )
+                except (PredictionPackageError, OSError, ValueError) as exc:
+                    st.error(f"Prediction rejected: {exc}")
+
+    available_labels: list[CanonicalLabel] = []
+    present: set[int] = set()
+    if case.segmentation is not None:
+        present.update(int(value) for value in np.unique(case.segmentation))
+    if imported_prediction is not None:
+        present.update(
+            int(value) for value in np.unique(imported_prediction.segmentation)
+        )
+    if present:
         available_labels = [
             label
             for label in CanonicalLabel
             if label != CanonicalLabel.BACKGROUND and int(label) in present
         ]
+    segmentation_cache_token = (
+        f"{file_signature(segmentation_path)}:"
+        f"{imported_prediction.package_sha256 if imported_prediction else 'source'}"
+    )
 
     with st.sidebar:
         st.divider()
@@ -511,13 +619,20 @@ def main() -> None:
     tumor = regions.get("Tumor", {})
     cyst = regions.get("Cyst", {})
     artery = regions.get("Renal artery", {})
+    vein = regions.get("Renal vein", {})
+    vessel_volume_ml = artery.get("volume_ml", 0.0) + vein.get("volume_ml", 0.0)
+    vessel_metric_label = "Renal vessel volume"
+    if imported_prediction is not None:
+        vessel_voxels = np.count_nonzero(imported_prediction.segmentation)
+        vessel_volume_ml = vessel_voxels * float(np.prod(case.spacing)) / 1000.0
+        vessel_metric_label = "Predicted vessel volume"
 
     metric_columns = st.columns(4)
     metrics = (
         ("Kidney volume", f"{kidney.get('volume_ml', 0):.1f} mL"),
         ("Tumor volume", f"{tumor.get('volume_ml', 0):.1f} mL"),
         ("Cyst volume", f"{cyst.get('volume_ml', 0):.1f} mL"),
-        ("Renal artery volume", f"{artery.get('volume_ml', 0):.1f} mL"),
+        (vessel_metric_label, f"{vessel_volume_ml:.1f} mL"),
     )
     for column, (label, value) in zip(metric_columns, metrics):  # noqa: B905
         column.metric(label, value)
@@ -543,6 +658,11 @@ def main() -> None:
                 overlay_mode=overlay_mode,
                 opacity=opacity,
                 linked_indices=indices if link_views and show_crosshairs else None,
+                supplemental_segmentation=(
+                    imported_prediction.segmentation
+                    if imported_prediction is not None
+                    else None
+                ),
             )
             st.image(view, width="stretch")
             st.caption(
@@ -589,13 +709,41 @@ def main() -> None:
                     hide_index=True,
                     width="stretch",
                 )
+        if imported_prediction is not None:
+            voxel_volume_ml = float(np.prod(case.spacing)) / 1000.0
+            provenance = imported_prediction.provenance
+            st.markdown("**Imported BA-Net vessel prediction**")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Structure": "Renal artery (predicted)",
+                            "Volume (mL)": round(
+                                provenance["artery_voxels"] * voxel_volume_ml, 2
+                            ),
+                        },
+                        {
+                            "Structure": "Renal vein (predicted)",
+                            "Volume (mL)": round(
+                                provenance["vein_voxels"] * voxel_volume_ml, 2
+                            ),
+                        },
+                    ]
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+            st.caption(
+                "Predicted volumes are kept separate from dataset annotations and are not "
+                "included in the ground-truth region table."
+            )
         st.caption(
             "Laterality is derived from connected components after canonical RAS orientation. "
             "Measurements are research outputs and are not clinically validated."
         )
 
     with tab_3d:
-        if case.segmentation is None:
+        if case.segmentation is None and imported_prediction is None:
             st.info("A segmentation is required to build the 3D surface model.")
         else:
             configured_model_directory = os.environ.get("RENAL_VESSEL_MODEL_DIR", "")
@@ -624,6 +772,9 @@ def main() -> None:
                 label in available_labels
                 for label in (CanonicalLabel.RENAL_ARTERY, CanonicalLabel.RENAL_VEIN)
             )
+            has_imported_vessels = imported_prediction is not None and bool(
+                np.any(imported_prediction.segmentation)
+            )
             with control_columns[1]:
                 include_generated_vessels = st.checkbox(
                     "Add generated vessels",
@@ -636,9 +787,14 @@ def main() -> None:
                 )
             with control_columns[2]:
                 vessel_methods = []
-                if vessel_model_bundle is not None:
+                if has_imported_vessels:
+                    vessel_methods.append("Imported BA-Net prediction")
+                elif source_has_renal_vessels:
+                    vessel_methods.append("Dataset annotations")
+                elif vessel_model_bundle is not None:
                     vessel_methods.append("KiPA22 3D U-Net (ML)")
-                vessel_methods.append("Image filter (not ML)")
+                if not has_renal_vessel_labels:
+                    vessel_methods.append("Image filter (not ML)")
                 vessel_method = st.selectbox(
                     "Generation method",
                     vessel_methods,
@@ -657,7 +813,11 @@ def main() -> None:
                     ),
                 )
 
-            if not has_renal_vessel_labels and vessel_model_bundle is None:
+            if (
+                not has_renal_vessel_labels
+                and vessel_model_bundle is None
+                and imported_prediction is None
+            ):
                 reason = model_error or (
                     "No validated KiPA22 ONNX model is installed on this server."
                 )
@@ -669,7 +829,8 @@ def main() -> None:
             label_key = "-".join(str(int(label)) for label in visible_labels) or "none"
             build_key = (
                 f"three_d_ready_{dataset_key}_{case_id}_{detail}_{label_key}_"
-                f"{include_generated_vessels}_{vessel_method}_{vessel_sensitivity}"
+                f"{include_generated_vessels}_{vessel_method}_{vessel_sensitivity}_"
+                f"{segmentation_cache_token}"
             )
             if st.button(
                 "Build interactive 3D",
@@ -688,13 +849,33 @@ def main() -> None:
                 with st.spinner("Building 3D surfaces and vessel layers…"):
                     label_meshes = []
                     for label in visible_labels:
+                        imported_vessel_label = (
+                            imported_prediction is not None
+                            and label
+                            in (
+                                CanonicalLabel.RENAL_ARTERY,
+                                CanonicalLabel.RENAL_VEIN,
+                            )
+                        )
+                        surface_segmentation = (
+                            imported_prediction.segmentation
+                            if imported_vessel_label
+                            else case.segmentation
+                        )
+                        if surface_segmentation is None:
+                            continue
+                        surface_signature = (
+                            f"prediction:{imported_prediction.package_sha256}"
+                            if imported_vessel_label
+                            else f"source:{file_signature(segmentation_path)}"
+                        )
                         mesh = cached_label_surface(
                             dataset_key,
                             case_id,
-                            file_signature(segmentation_path),
+                            surface_signature,
                             int(label),
                             detail,
-                            case.segmentation,
+                            surface_segmentation,
                             case.affine,
                             case.spacing,
                         )
@@ -712,7 +893,7 @@ def main() -> None:
                             dataset_key,
                             case_id,
                             file_signature(image_path),
-                            file_signature(segmentation_path),
+                            segmentation_cache_token,
                             vessel_model_bundle.manifest.artifact_sha256,
                             case.image,
                             case.segmentation,
@@ -737,7 +918,7 @@ def main() -> None:
                             dataset_key,
                             case_id,
                             file_signature(image_path),
-                            file_signature(segmentation_path),
+                            segmentation_cache_token,
                             vessel_sensitivity,
                             detail,
                             case.image,
@@ -818,11 +999,29 @@ def main() -> None:
                             "must be externally validated for the scanner, contrast phase, "
                             "and patient population where it is used."
                         )
+                    elif imported_prediction is not None:
+                        provenance = imported_prediction.provenance
+                        st.success(
+                            "Imported ML inference: BA-Net · published KiPA22 checkpoint · "
+                            f"fold {provenance['model']['fold']} · source CT identity and "
+                            "geometry verified."
+                        )
+                        st.caption(
+                            "The package proves which CT was processed and which published "
+                            "checkpoint was requested; it is not an accuracy validation for "
+                            "this case."
+                        )
 
-            if has_renal_vessel_labels:
+            if source_has_renal_vessels:
                 st.success(
                     "This case contains mapped renal artery/vein annotations; they are "
                     "rendered directly when selected in Structures."
+                )
+            elif imported_prediction is not None:
+                st.warning(
+                    "The imported BA-Net prediction was trained on cropped KiPA22 CTA. "
+                    "Predictions on KiTS23 or another contrast phase are out-of-domain and "
+                    "are not ground truth."
                 )
             elif vessel_method == "KiPA22 3D U-Net (ML)":
                 st.warning(
@@ -849,6 +1048,11 @@ def main() -> None:
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "case": case.json_metadata(),
             "analysis": analysis,
+            "imported_vessel_prediction": (
+                imported_prediction.provenance
+                if imported_prediction is not None
+                else None
+            ),
             "research_use_only": True,
         }
         st.download_button(
@@ -876,6 +1080,9 @@ def main() -> None:
         st.code(adapter.info.expected_layout, language="text")
         if case.source_labels:
             st.write("Source label values found:", list(case.source_labels))
+        if imported_prediction is not None:
+            st.markdown("**Vessel prediction provenance**")
+            st.json(imported_prediction.provenance, expanded=False)
 
     st.divider()
     st.caption("Research software · Not a medical device · Not for diagnostic use")

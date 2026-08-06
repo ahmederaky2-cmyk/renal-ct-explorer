@@ -1,13 +1,24 @@
+from __future__ import annotations
+
+import gzip
+import hashlib
+import io
 import json
 import shutil
+import zipfile
 from pathlib import Path
 
+import nibabel as nib
 import numpy as np
 
 from renal_explorer.analysis import analyze_case, region_statistics
 from renal_explorer.datasets import KiPA22Adapter, KiTS23Adapter, remap_labels
 from renal_explorer.labels import CanonicalLabel
 from renal_explorer.models import VolumeCase
+from renal_explorer.prediction_packages import (
+    PredictionPackageError,
+    load_banet_prediction_package,
+)
 from renal_explorer.remote_data import RemoteDataError, ensure_demo_case, remote_urls
 from renal_explorer.rendering import render_view
 from renal_explorer.three_d import candidate_vessel_mesh, surface_mesh
@@ -88,6 +99,31 @@ def test_rendering_handles_last_slice_and_anisotropic_spacing() -> None:
     assert view.ndim == 3
     assert view.shape[2] == 3
     assert view.dtype == np.uint8
+
+
+def test_rendering_keeps_prediction_as_a_separate_overlay_layer() -> None:
+    image = np.zeros((8, 8, 8), dtype=np.float32)
+    segmentation = np.zeros(image.shape, dtype=np.uint8)
+    segmentation[1:7, 1:7, 1:7] = int(CanonicalLabel.KIDNEY)
+    prediction = np.zeros(image.shape, dtype=np.uint8)
+    prediction[3:5, 3:5, 3:5] = int(CanonicalLabel.RENAL_ARTERY)
+
+    view = render_view(
+        image=image,
+        segmentation=segmentation,
+        spacing=(1.0, 1.0, 1.0),
+        orientation="Axial",
+        index=4,
+        level=40,
+        width=400,
+        visible_labels=[CanonicalLabel.KIDNEY, CanonicalLabel.RENAL_ARTERY],
+        overlay_mode="Fill",
+        opacity=1.0,
+        supplemental_segmentation=prediction,
+    )
+
+    assert np.any(np.all(view == (45, 200, 90), axis=2))
+    assert np.any(np.all(view == (255, 55, 55), axis=2))
 
 
 def test_3d_surface_uses_physical_coordinates() -> None:
@@ -316,3 +352,74 @@ def test_remote_demo_rejects_arbitrary_case() -> None:
         pass
     else:
         raise AssertionError("An arbitrary remote case should not be accepted")
+
+
+def _banet_package(
+    source: np.ndarray,
+    affine: np.ndarray,
+    case_id: str = "case_test",
+    image_digest: str | None = None,
+) -> tuple[bytes, str]:
+    digest = image_digest or hashlib.sha256(b"source CT").hexdigest()
+    prediction_bytes = gzip.compress(
+        nib.Nifti1Image(source.astype(np.uint8), affine).to_bytes()
+    )
+    provenance = {
+        "schema_version": 1,
+        "case_id": case_id,
+        "source_image_sha256": digest,
+        "source_image_shape": list(source.shape),
+        "source_image_affine": affine.tolist(),
+        "model": {
+            "name": "BA-Net",
+            "fold": 0,
+            "weights_doi": "10.5281/zenodo.7030423",
+        },
+        "research_only": True,
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("vessels.nii.gz", prediction_bytes)
+        archive.writestr("provenance.json", json.dumps(provenance))
+    return buffer.getvalue(), digest
+
+
+def test_banet_prediction_package_is_identity_checked_and_mapped() -> None:
+    affine = np.diag([1.2, 1.1, 2.0, 1.0])
+    source = np.zeros((8, 7, 6), dtype=np.uint8)
+    source[1:3, 2:5, 2:4] = 1  # KiPA renal vein
+    source[4:7, 2:4, 1:5] = 3  # KiPA renal artery
+    payload, image_digest = _banet_package(source, affine)
+
+    imported = load_banet_prediction_package(
+        payload,
+        "case_test",
+        source.shape,
+        affine,
+        image_digest,
+    )
+
+    assert np.count_nonzero(imported.segmentation == CanonicalLabel.RENAL_VEIN) == 12
+    assert np.count_nonzero(imported.segmentation == CanonicalLabel.RENAL_ARTERY) == 24
+    assert imported.provenance["vein_voxels"] == 12
+    assert imported.provenance["artery_voxels"] == 24
+    assert len(imported.package_sha256) == 64
+
+
+def test_banet_prediction_package_rejects_wrong_source_ct() -> None:
+    affine = np.eye(4)
+    source = np.zeros((4, 4, 4), dtype=np.uint8)
+    payload, _digest = _banet_package(source, affine)
+
+    try:
+        load_banet_prediction_package(
+            payload,
+            "case_test",
+            source.shape,
+            affine,
+            hashlib.sha256(b"another CT").hexdigest(),
+        )
+    except PredictionPackageError as exc:
+        assert "SHA-256 mismatch" in str(exc)
+    else:
+        raise AssertionError("A prediction for another CT should be rejected")

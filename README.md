@@ -45,6 +45,14 @@ metrics, and validation status before inference. Without a validated artifact it
 labels the Frangi/Sato option **Image filter (not ML)**. See
 [`training/README.md`](training/README.md) for the complete workflow.
 
+For users who cannot access the KiPA22 training data, the repository also includes a
+[free BA-Net single-fold Colab notebook](notebooks/ba_net_single_fold_inference.ipynb). It
+uses the authors' published checkpoint without downloading the training set and retrieves
+only one BA-Net fold from the 3.7 GB Zenodo archive. The notebook exports a compact ZIP whose
+case ID, source CT SHA-256, dimensions, affine, labels, model source, and research-only status
+are checked by Streamlit before the artery/vein overlay is accepted. Imported predictions are
+kept separate from dataset annotations in measurements and exports.
+
 ## 3D quality architecture
 
 The 3D pipeline is designed around measurable geometric fidelity, not only a smooth-looking
@@ -73,6 +81,12 @@ For trained inference, the KiPA22 model crops around the known renal region, res
 model's recorded physical spacing, performs overlapping Gaussian-weighted 3D patch inference,
 maps output channels into the common label vocabulary, removes physically tiny components,
 and records model version, validation metrics, predicted-vessel confidence, and voxel counts.
+
+The Colab checkpoint route deliberately runs outside Streamlit Community Cloud. Free hosting
+therefore performs only package validation, 2D overlay rendering, and 3D surface generation;
+it never downloads the multi-gigabyte BA-Net ensemble. Because the checkpoint's training
+domain is cropped CTA, the interface warns that predictions on KiTS23 and other CT phases are
+out of domain rather than presenting them as ground truth.
 
 ### Release quality gates
 
