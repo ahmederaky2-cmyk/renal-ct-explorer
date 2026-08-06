@@ -8,10 +8,6 @@ from scipy import ndimage as ndi
 from skimage.filters import frangi, sato
 from skimage.measure import marching_cubes
 from skimage.morphology import remove_small_objects, skeletonize
-from vtkmodules.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray, vtk_to_numpy
-from vtkmodules.vtkCommonCore import vtkPoints
-from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
-from vtkmodules.vtkFiltersCore import vtkDecimatePro, vtkWindowedSincPolyDataFilter
 
 from .labels import CanonicalLabel
 
@@ -113,7 +109,14 @@ def _topology_metrics(vertices: np.ndarray, faces: np.ndarray) -> dict[str, Any]
     }
 
 
-def _polydata(vertices: np.ndarray, faces: np.ndarray) -> vtkPolyData:
+def _polydata(vertices: np.ndarray, faces: np.ndarray) -> Any:
+    # VTK is intentionally imported only when a 3D mesh is requested. Loading its
+    # native libraries while Streamlit starts can exhaust a small Community Cloud
+    # instance before the first page is rendered.
+    from vtkmodules.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
+    from vtkmodules.vtkCommonCore import vtkPoints
+    from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
+
     points = vtkPoints()
     points.SetData(numpy_to_vtk(vertices.astype(np.float64), deep=True))
     cells = vtkCellArray()
@@ -129,7 +132,9 @@ def _polydata(vertices: np.ndarray, faces: np.ndarray) -> vtkPolyData:
     return polydata
 
 
-def _polydata_arrays(polydata: vtkPolyData) -> tuple[np.ndarray, np.ndarray]:
+def _polydata_arrays(polydata: Any) -> tuple[np.ndarray, np.ndarray]:
+    from vtkmodules.util.numpy_support import vtk_to_numpy
+
     vertices = vtk_to_numpy(polydata.GetPoints().GetData()).astype(np.float64, copy=True)
     connectivity = vtk_to_numpy(
         polydata.GetPolys().GetConnectivityArray()
@@ -143,6 +148,8 @@ def _windowed_sinc_smooth(
     faces: np.ndarray,
     smoothing_factor: float,
 ) -> np.ndarray:
+    from vtkmodules.vtkFiltersCore import vtkWindowedSincPolyDataFilter
+
     smoother = vtkWindowedSincPolyDataFilter()
     smoother.SetInputData(_polydata(vertices, faces))
     smoother.SetNumberOfIterations(int(round(20 + smoothing_factor * 40)))
@@ -201,6 +208,8 @@ def _decimate(
 ) -> tuple[np.ndarray, np.ndarray]:
     if faces.shape[0] <= maximum_faces:
         return vertices, faces
+    from vtkmodules.vtkFiltersCore import vtkDecimatePro
+
     decimator = vtkDecimatePro()
     decimator.SetInputData(_polydata(vertices, faces))
     decimator.SetTargetReduction(1.0 - maximum_faces / faces.shape[0])
