@@ -162,7 +162,7 @@ class KiPA22Adapter(CaseDirectoryAdapter):
         key="kipa22",
         name="KiPA22",
         source_url="https://kipa22.grand-challenge.org/",
-        license_name="Challenge terms apply",
+        license_name="CC BY-NC-ND + participant agreement",
         description="CTA with kidney, tumor, renal artery, and renal vein labels.",
         expected_layout="case_xxxxx/{imaging.nii.gz, segmentation.nii.gz}",
     )

@@ -38,6 +38,13 @@ shown when a dataset supplies those labels (for example KiPA22). KiTS23 does not
 renal vessel annotations, so its optional cyan vessel layer is an image-derived research
 candidate only and does not classify arteries versus veins.
 
+The application now has a separate real-ML vessel path. A validated compact 3D U-Net can be
+trained on authorized KiPA22 CTA, exported to ONNX, and loaded by the app as separate renal
+artery and vein predictions. The app verifies the model hash, training provenance, held-out
+metrics, and validation status before inference. Without a validated artifact it explicitly
+labels the Frangi/Sato option **Image filter (not ML)**. See
+[`training/README.md`](training/README.md) for the complete workflow.
+
 ## 3D quality architecture
 
 The 3D pipeline is designed around measurable geometric fidelity, not only a smooth-looking
@@ -61,6 +68,11 @@ For unlabeled vessels, the app combines physical-scale Frangi and Sato responses
 threshold connectivity, renal-proximity and component filtering, a volume-calibrated mesh,
 and a skeleton centerline. This is a stronger visualization heuristic than a single global
 Frangi threshold, but it remains a candidate layer—not an artery/vein segmentation.
+
+For trained inference, the KiPA22 model crops around the known renal region, resamples to the
+model's recorded physical spacing, performs overlapping Gaussian-weighted 3D patch inference,
+maps output channels into the common label vocabulary, removes physically tiny components,
+and records model version, validation metrics, predicted-vessel confidence, and voxel counts.
 
 ### Release quality gates
 
@@ -219,7 +231,8 @@ research deployment.
 ## Dataset sources and terms
 
 - KiTS23: <https://github.com/neheller/kits23> — CC BY-NC-SA 4.0 data.
-- KiPA22: <https://kipa22.grand-challenge.org/> — registration and challenge terms apply.
+- KiPA22: <https://kipa22.grand-challenge.org/> — CC BY-NC-ND plus participant
+  registration; redistribution is prohibited by the challenge rules.
 - C4KC-KiTS: <https://www.cancerimagingarchive.net/collection/c4kc-kits/> — CC BY 3.0.
 - AbdomenAtlas: <https://github.com/MrGiovanni/AbdomenAtlas> — check the selected release.
 - AMOS22: <https://amos22.grand-challenge.org/> — check challenge terms.

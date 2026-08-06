@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "name": "KiPA22 compact 3D vessel U-Net",
+  "version": "1.0.0",
+  "dataset": "KiPA22 CTA",
+  "dataset_url": "https://kipa22.grand-challenge.org/",
+  "research_only": true,
+  "validated": false,
+  "validation_fold": 0,
+  "training_cases": 0,
+  "target_spacing_mm": [1.0, 1.0, 1.0],
+  "patch_size": [96, 96, 96],
+  "overlap": 0.5,
+  "intensity_clip_hu": [-100.0, 1000.0],
+  "canonical_labels": [0, 5, 1, 4, 2],
+  "minimum_component_mm3": 10.0,
+  "artifact_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "validation_metrics": {
+    "renal_artery_dice": 0.0,
+    "renal_vein_dice": 0.0,
+    "mean_vessel_dice": 0.0
+  }
+}

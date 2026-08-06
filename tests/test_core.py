@@ -1,3 +1,5 @@
+import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +11,14 @@ from renal_explorer.models import VolumeCase
 from renal_explorer.remote_data import RemoteDataError, ensure_demo_case, remote_urls
 from renal_explorer.rendering import render_view
 from renal_explorer.three_d import candidate_vessel_mesh, surface_mesh
+from renal_explorer.vessel_ml import (
+    VesselModelBundle,
+    VesselModelManifest,
+    discover_model_bundle,
+    predict_vessels,
+    resolve_model_bundle,
+    sha256_file,
+)
 
 
 def synthetic_case(segmentation: np.ndarray) -> VolumeCase:
@@ -131,6 +141,128 @@ def test_candidate_vessels_require_a_renal_roi() -> None:
         case.spacing,
     )
     assert mesh is None
+
+
+def _validated_manifest(digest: str) -> VesselModelManifest:
+    return VesselModelManifest.from_dict(
+        {
+            "schema_version": 1,
+            "name": "Test KiPA22 model",
+            "version": "1.0.0",
+            "dataset": "KiPA22 CTA",
+            "dataset_url": "https://kipa22.grand-challenge.org/",
+            "research_only": True,
+            "validated": True,
+            "validation_fold": 0,
+            "training_cases": 56,
+            "target_spacing_mm": [1.0, 1.0, 1.0],
+            "patch_size": [16, 16, 16],
+            "overlap": 0.5,
+            "intensity_clip_hu": [-100.0, 1000.0],
+            "canonical_labels": [0, 5, 1, 4, 2],
+            "minimum_component_mm3": 1.0,
+            "artifact_sha256": digest,
+            "validation_metrics": {
+                "renal_artery_dice": 0.75,
+                "renal_vein_dice": 0.70,
+                "mean_vessel_dice": 0.725,
+            },
+        }
+    )
+
+
+def test_ml_model_bundle_requires_validated_matching_artifact(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.onnx"
+    model_path.write_bytes(b"validated model")
+    manifest = _validated_manifest(sha256_file(model_path))
+    manifest_data = {
+        **manifest.__dict__,
+        "target_spacing_mm": list(manifest.target_spacing_mm),
+        "patch_size": list(manifest.patch_size),
+        "intensity_clip_hu": list(manifest.intensity_clip_hu),
+        "canonical_labels": list(manifest.canonical_labels),
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest_data))
+
+    bundle = discover_model_bundle(tmp_path)
+
+    assert bundle is not None
+    assert bundle.manifest.validated is True
+    assert bundle.manifest.dataset == "KiPA22 CTA"
+
+
+def test_ml_vessel_inference_maps_channels_to_artery_and_vein(tmp_path: Path) -> None:
+    class Input:
+        name = "ct"
+
+    class FakeSession:
+        def get_inputs(self):
+            return [Input()]
+
+        def run(self, _outputs, feed):
+            volume = feed["ct"]
+            logits = np.full((1, 5, *volume.shape[2:]), -5.0, dtype=np.float32)
+            midpoint = volume.shape[2] // 2
+            logits[:, 1, :midpoint] = 5.0
+            logits[:, 3, midpoint:] = 5.0
+            return [logits]
+
+    model_path = tmp_path / "model.onnx"
+    model_path.write_bytes(b"test")
+    manifest_path = tmp_path / "manifest.json"
+    manifest = _validated_manifest(sha256_file(model_path))
+    bundle = VesselModelBundle(model_path, manifest_path, manifest)
+    image = np.full((20, 20, 20), 200.0, dtype=np.float32)
+    kidney = np.zeros(image.shape, dtype=np.uint8)
+    kidney[4:16, 4:16, 4:16] = int(CanonicalLabel.KIDNEY)
+
+    prediction = predict_vessels(
+        image,
+        (1.0, 1.0, 1.0),
+        kidney,
+        bundle,
+        session=FakeSession(),
+    )
+
+    assert np.any(prediction.segmentation == int(CanonicalLabel.RENAL_ARTERY))
+    assert np.any(prediction.segmentation == int(CanonicalLabel.RENAL_VEIN))
+    assert prediction.provenance["dataset"] == "KiPA22 CTA"
+    assert prediction.provenance["mean_vessel_confidence"] > 0.9
+
+
+def test_remote_ml_bundle_download_is_hash_verified(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source"
+    cache = tmp_path / "cache"
+    source.mkdir()
+    (source / "model.onnx").write_bytes(b"portable validated model")
+    manifest = _validated_manifest(sha256_file(source / "model.onnx"))
+    manifest_data = {
+        **manifest.__dict__,
+        "target_spacing_mm": list(manifest.target_spacing_mm),
+        "patch_size": list(manifest.patch_size),
+        "intensity_clip_hu": list(manifest.intensity_clip_hu),
+        "canonical_labels": list(manifest.canonical_labels),
+    }
+    (source / "manifest.json").write_text(json.dumps(manifest_data))
+    monkeypatch.delenv("RENAL_VESSEL_MODEL_DIR", raising=False)
+    monkeypatch.setenv("RENAL_VESSEL_MANIFEST_URL", "https://example.test/manifest")
+    monkeypatch.setenv("RENAL_VESSEL_MODEL_URL", "https://example.test/model")
+
+    def fake_download(url, destination, maximum_bytes):
+        del maximum_bytes
+        filename = "manifest.json" if url.endswith("manifest") else "model.onnx"
+        shutil.copyfile(source / filename, destination)
+
+    monkeypatch.setattr("renal_explorer.vessel_ml._download_file", fake_download)
+
+    bundle = resolve_model_bundle(cache_dir=cache)
+
+    assert bundle is not None
+    assert bundle.model_path.read_bytes() == b"portable validated model"
+    assert bundle.manifest.artifact_sha256 == sha256_file(bundle.model_path)
 
 
 def test_case_directory_discovery(tmp_path: Path) -> None:

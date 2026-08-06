@@ -35,6 +35,11 @@ from renal_explorer.three_d import (  # noqa: E402
     candidate_vessel_mesh,
     surface_mesh,
 )
+from renal_explorer.vessel_ml import (  # noqa: E402
+    VesselModelError,
+    predict_vessels,
+    resolve_model_bundle,
+)
 
 WINDOW_PRESETS = {
     "Abdomen": (60, 360),
@@ -147,6 +152,44 @@ def cached_candidate_vessels(
         _spacing,
         sensitivity=sensitivity,
         detail=detail,
+    )
+
+
+@st.cache_resource(show_spinner=False, max_entries=1)
+def cached_vessel_model_bundle(
+    configured_directory: str,
+    manifest_url: str,
+    model_url: str,
+):
+    del manifest_url, model_url
+    model_directory = Path(configured_directory).expanduser() if configured_directory else None
+    return resolve_model_bundle(model_directory)
+
+
+@st.cache_data(show_spinner=False, max_entries=2)
+def cached_ml_vessels(
+    dataset_key: str,
+    case_id: str,
+    image_signature: tuple[int, int],
+    segmentation_signature: tuple[int, int] | None,
+    model_sha256: str,
+    _image: np.ndarray,
+    _segmentation: np.ndarray | None,
+    _spacing: tuple[float, float, float],
+    _bundle,
+):
+    del (
+        dataset_key,
+        case_id,
+        image_signature,
+        segmentation_signature,
+        model_sha256,
+    )
+    return predict_vessels(
+        _image,
+        _spacing,
+        _segmentation,
+        _bundle,
     )
 
 
@@ -555,7 +598,21 @@ def main() -> None:
         if case.segmentation is None:
             st.info("A segmentation is required to build the 3D surface model.")
         else:
-            control_columns = st.columns(3)
+            configured_model_directory = os.environ.get("RENAL_VESSEL_MODEL_DIR", "")
+            configured_manifest_url = os.environ.get("RENAL_VESSEL_MANIFEST_URL", "")
+            configured_model_url = os.environ.get("RENAL_VESSEL_MODEL_URL", "")
+            model_error = None
+            try:
+                vessel_model_bundle = cached_vessel_model_bundle(
+                    configured_model_directory,
+                    configured_manifest_url,
+                    configured_model_url,
+                )
+            except VesselModelError as exc:
+                vessel_model_bundle = None
+                model_error = str(exc)
+
+            control_columns = st.columns(4)
             with control_columns[0]:
                 detail = st.selectbox(
                     "3D detail",
@@ -568,27 +625,51 @@ def main() -> None:
                 for label in (CanonicalLabel.RENAL_ARTERY, CanonicalLabel.RENAL_VEIN)
             )
             with control_columns[1]:
-                include_candidates = st.checkbox(
-                    "Estimate unlabeled vessels",
+                include_generated_vessels = st.checkbox(
+                    "Add generated vessels",
                     value=not has_renal_vessel_labels,
+                    disabled=has_renal_vessel_labels,
                     help=(
-                        "Fuses physical-scale Frangi and Sato vesselness, connectivity, "
-                        "component filtering, and centerline extraction when annotations "
-                        "are unavailable."
+                        "Uses a validated KiPA22 model when installed, or an explicitly "
+                        "experimental image filter as a fallback."
                     ),
                 )
             with control_columns[2]:
+                vessel_methods = []
+                if vessel_model_bundle is not None:
+                    vessel_methods.append("KiPA22 3D U-Net (ML)")
+                vessel_methods.append("Image filter (not ML)")
+                vessel_method = st.selectbox(
+                    "Generation method",
+                    vessel_methods,
+                    disabled=(
+                        has_renal_vessel_labels or not include_generated_vessels
+                    ),
+                )
+            with control_columns[3]:
                 vessel_sensitivity = st.selectbox(
-                    "Vessel sensitivity",
+                    "Filter sensitivity",
                     ("Strict", "Balanced", "Sensitive"),
                     index=1,
-                    disabled=not include_candidates,
+                    disabled=(
+                        not include_generated_vessels
+                        or vessel_method == "KiPA22 3D U-Net (ML)"
+                    ),
+                )
+
+            if not has_renal_vessel_labels and vessel_model_bundle is None:
+                reason = model_error or (
+                    "No validated KiPA22 ONNX model is installed on this server."
+                )
+                st.info(
+                    f"Real vessel ML is currently unavailable: {reason} The selectable "
+                    "image-filter fallback is not presented as machine learning."
                 )
 
             label_key = "-".join(str(int(label)) for label in visible_labels) or "none"
             build_key = (
                 f"three_d_ready_{dataset_key}_{case_id}_{detail}_{label_key}_"
-                f"{include_candidates}_{vessel_sensitivity}"
+                f"{include_generated_vessels}_{vessel_method}_{vessel_sensitivity}"
             )
             if st.button(
                 "Build interactive 3D",
@@ -604,7 +685,7 @@ def main() -> None:
                     "It is generated on the server and cached for later visitors."
                 )
             else:
-                with st.spinner("Building 3D surfaces and vessel candidates…"):
+                with st.spinner("Building 3D surfaces and vessel layers…"):
                     label_meshes = []
                     for label in visible_labels:
                         mesh = cached_label_surface(
@@ -621,7 +702,37 @@ def main() -> None:
                             label_meshes.append((label, mesh))
 
                     vessel_candidates = None
-                    if include_candidates:
+                    ml_prediction = None
+                    if (
+                        include_generated_vessels
+                        and vessel_method == "KiPA22 3D U-Net (ML)"
+                        and vessel_model_bundle is not None
+                    ):
+                        ml_prediction = cached_ml_vessels(
+                            dataset_key,
+                            case_id,
+                            file_signature(image_path),
+                            file_signature(segmentation_path),
+                            vessel_model_bundle.manifest.artifact_sha256,
+                            case.image,
+                            case.segmentation,
+                            case.spacing,
+                            vessel_model_bundle,
+                        )
+                        for vessel_label in (
+                            CanonicalLabel.RENAL_ARTERY,
+                            CanonicalLabel.RENAL_VEIN,
+                        ):
+                            vessel_mesh = surface_mesh(
+                                ml_prediction.segmentation,
+                                case.affine,
+                                case.spacing,
+                                int(vessel_label),
+                                detail,
+                            )
+                            if vessel_mesh is not None:
+                                label_meshes.append((vessel_label, vessel_mesh))
+                    elif include_generated_vessels:
                         vessel_candidates = cached_candidate_vessels(
                             dataset_key,
                             case_id,
@@ -694,11 +805,29 @@ def main() -> None:
                             "limited by physical displacement and volume error. Watertight "
                             "requires zero boundary, non-manifold, and degenerate edges."
                         )
+                    if ml_prediction is not None:
+                        provenance = ml_prediction.provenance
+                        st.success(
+                            f"ML inference: {provenance['model']} "
+                            f"v{provenance['version']} · trained on "
+                            f"{provenance['dataset']} · mean predicted-vessel confidence "
+                            f"{provenance['mean_vessel_confidence']:.1%}."
+                        )
+                        st.caption(
+                            "This is a trained model output, but remains research-only and "
+                            "must be externally validated for the scanner, contrast phase, "
+                            "and patient population where it is used."
+                        )
 
             if has_renal_vessel_labels:
                 st.success(
                     "This case contains mapped renal artery/vein annotations; they are "
                     "rendered directly when selected in Structures."
+                )
+            elif vessel_method == "KiPA22 3D U-Net (ML)":
+                st.warning(
+                    "The ML model is trained on cropped KiPA22 CTA. Predictions on KiTS23 "
+                    "or another contrast phase are out-of-domain and are not ground truth."
                 )
             else:
                 st.warning(
