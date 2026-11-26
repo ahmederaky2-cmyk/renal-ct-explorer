@@ -590,10 +590,11 @@ def nephrometry(unit: RenalUnit, distances: dict[str, Any]) -> dict[str, Any]:
 
     def polar_points(lower: float, upper: float) -> tuple[int, float]:
         fraction = float(np.mean((tumor_long >= lower) & (tumor_long <= upper)))
+        # Crossing the axial renal midline is L3 whatever the polar lines say (review).
+        if crosses_midline or fraction > 0.5 or fraction >= 0.99:
+            return 3, fraction
         if fraction <= 0.01:
             return 1, fraction
-        if fraction > 0.5 or crosses_midline or fraction >= 0.99:
-            return 3, fraction
         return 2, fraction
 
     span = float(renal_long.max() - renal_long.min())
@@ -749,6 +750,9 @@ def simulate_resection(
     removed = float(np.count_nonzero(resected_parenchyma)) * voxel_ml
     preserved = ipsilateral - removed
     contralateral = unit.contralateral_parenchyma_ml
+    # Bilateral figures need an established opposite kidney: with an unknown side (or no
+    # opposite kidney found in the scan) the denominator is unknown, so they are withheld.
+    contralateral_known = contralateral > 0
     total_before = ipsilateral + contralateral
     total_after = preserved + contralateral
     warnings = []
@@ -768,8 +772,13 @@ def simulate_resection(
         "ipsilateral_parenchyma_ml": ipsilateral,
         "preserved_parenchyma_ml": preserved,
         "preserved_ipsilateral_pct": 100.0 * preserved / ipsilateral if ipsilateral else 0.0,
-        "contralateral_parenchyma_ml": contralateral,
-        "preserved_total_pct": 100.0 * total_after / total_before if total_before else 0.0,
+        "contralateral_parenchyma_ml": contralateral if contralateral_known else None,
+        "contralateral_status": (
+            "measured" if contralateral_known else "not established (side unknown or not found)"
+        ),
+        "preserved_total_pct": (
+            100.0 * total_after / total_before if contralateral_known and total_before else None
+        ),
         "ipsilateral_share_before_pct": (
             100.0 * ipsilateral / total_before if contralateral and total_before else None
         ),
@@ -1006,7 +1015,7 @@ def arterial_territories(unit: RenalUnit, depth: int = 1) -> dict[str, Any] | No
         "ischemia_estimate_reliable": reliable,
         "branches": branches,
         "feeding_branches": [branch["name"] for branch in feeding],
-        "main_clamp_ischemic_ml": parenchyma_total,
+        "main_clamp_ischemic_ml": parenchyma_total if reliable else None,
         # Withheld (None) when the tree looks incomplete, also in JSON (review finding).
         "selective_clamp_ischemic_ml": selective_ml if reliable else None,
         "selective_clamp_ischemic_pct": (

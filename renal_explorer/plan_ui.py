@@ -211,6 +211,11 @@ def build_plan_figure(
     return figure
 
 
+def _l_text(renal: dict[str, Any]) -> str:
+    low, high = renal.get("L_range") or (renal["L"], renal["L"])
+    return str(renal["L"]) if low == high else f"{low}–{high} (est. {renal['L']})"
+
+
 def _score_tables(summary: dict[str, Any]) -> None:
     scores = summary["scores"]
     renal = scores["renal"]
@@ -251,8 +256,9 @@ def _score_tables(summary: dict[str, Any]) -> None:
                     ),
                     (
                         "L – polar lines",
-                        f"{100 * scores['between_polar_lines_fraction']:.0f} % between lines",
-                        renal["L"],
+                        f"{100 * scores['between_polar_lines_fraction']:.0f} % between lines"
+                        + (", crosses midline" if scores["crosses_midline"] else ""),
+                        _l_text(renal),
                     ),
                     (
                         "h – hilar",
@@ -437,7 +443,12 @@ def render_plan_tab(
             ("Tumour volume", f"{resection['tumor_ml']:.1f} mL"),
             ("Parenchyma removed", f"{resection['removed_parenchyma_ml']:.1f} mL"),
             ("Ipsilateral parenchyma kept", f"{resection['preserved_ipsilateral_pct']:.1f} %"),
-            ("Total parenchyma kept", f"{resection['preserved_total_pct']:.1f} %"),
+            (
+                "Total parenchyma kept",
+                f"{resection['preserved_total_pct']:.1f} %"
+                if resection["preserved_total_pct"] is not None
+                else f"not shown: opposite kidney {resection['contralateral_status']}",
+            ),
         ]
         if resection["ipsilateral_share_before_pct"] is not None:
             rows.append(

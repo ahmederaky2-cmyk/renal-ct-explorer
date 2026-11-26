@@ -619,10 +619,13 @@ def main() -> None:
         ]
     # Grid identity is part of every derived cache key: the same file loaded at demo and at
     # full resolution must never share plans, meshes or slice positions (review finding).
+    # Grid and CT identity are part of every derived cache key: the same labels on another
+    # grid, or under a replaced CT (the sinus proxy reads HU), must never share results.
+    active_grid = grid_token(case.image.shape, case.affine, case.metadata.get("resolution"))
     segmentation_cache_token = (
         f"{file_signature(segmentation_path)}:"
         f"{imported_prediction.package_sha256 if imported_prediction else 'source'}:"
-        f"{grid_token(case.image.shape, case.affine, case.metadata.get('resolution'))}"
+        f"ct={file_signature(image_path)}:{active_grid}"
     )
 
     with st.sidebar:
@@ -961,9 +964,9 @@ def main() -> None:
                         if surface_segmentation is None:
                             continue
                         surface_signature = (
-                            f"prediction:{imported_prediction.package_sha256}"
+                            f"prediction:{imported_prediction.package_sha256}:{active_grid}"
                             if imported_vessel_label
-                            else f"source:{file_signature(segmentation_path)}"
+                            else f"source:{file_signature(segmentation_path)}:{active_grid}"
                         )
                         mesh = cached_label_surface(
                             dataset_key,

@@ -82,6 +82,11 @@ def _fmt(value: Any, digits: int = 1, suffix: str = "") -> str:
     return f"{value}{suffix}"
 
 
+def _l_range(renal: dict[str, Any]) -> str:
+    low, high = renal.get("L_range") or (renal["L"], renal["L"])
+    return str(renal["L"]) if low == high else f"{low}-{high} (est. {renal['L']})"
+
+
 def _fmt_list(values) -> str:
     return " × ".join(f"{float(value):.2f}" for value in values) if values else "?"
 
@@ -189,7 +194,7 @@ def plan_report_pdf(
                     f"R{renal['R']} E{renal['E']} "
                     f"N{_fmt(renal['N']) if renal['N'] is not None else _n_range(renal)} "
                     f"A:{renal['A']} "
-                    f"L{renal['L']} h:{_fmt(renal['hilar'])}",
+                    f"L{_l_range(renal)} h:{_fmt(renal['hilar'])}",
                 ],
                 [
                     "PADUA",

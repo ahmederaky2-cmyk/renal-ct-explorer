@@ -372,7 +372,8 @@ def test_split_ipsilateral_kidney_is_not_an_opposite_kidney() -> None:
     ] = 0
     summary = build_plan(segmentation, affine, SPACING, image)["summary"]
     assert summary["side"] == "Unknown"
-    assert summary["resection"]["contralateral_parenchyma_ml"] == 0.0
+    assert summary["resection"]["contralateral_parenchyma_ml"] is None
+    assert summary["resection"]["preserved_total_pct"] is None
 
     # With the right kidney back, the side is known and only the right kidney counts as
     # contralateral (the lower left piece does not).
@@ -436,8 +437,9 @@ def test_lateral_same_side_fragment_never_makes_the_plan_right() -> None:
     segmentation[fragment] = int(CanonicalLabel.KIDNEY)  # separate piece, disjoint x range
     summary = build_plan(segmentation, affine, SPACING, image)["summary"]
     assert summary["side"] == "Unknown"
-    assert summary["resection"]["contralateral_parenchyma_ml"] == 0.0
+    assert summary["resection"]["contralateral_parenchyma_ml"] is None
     assert summary["resection"]["ipsilateral_share_before_pct"] is None
+    assert summary["resection"]["preserved_total_pct"] is None
 
 
 def test_demo_resolution_is_marked_in_pdf_and_stl() -> None:
@@ -460,3 +462,36 @@ def test_demo_resolution_is_marked_in_pdf_and_stl() -> None:
     payload = stl_zip({"Tumor": mesh}, resolution=summary["resolution"])
     archive = zipfile.ZipFile(io.BytesIO(payload))
     assert "DEMO RESOLUTION" in archive.read("README.txt").decode()
+
+
+def test_midline_crossing_tumour_is_l3_even_outside_polar_lines() -> None:
+    """Regression (fourth review): a displaced sinus proxy gave L1 to a midline tumour."""
+
+    from renal_explorer.planning import extract_renal_unit, nephrometry
+
+    tumor_center = (CENTER_MM[0] - 20.0, CENTER_MM[1], CENTER_MM[2])
+    segmentation, image, affine = phantom(tumor_center, 6.0)
+    unit = extract_renal_unit(segmentation, affine, SPACING, image)
+    # Push the sinus proxy cranially so that no tumour voxel lies between its lines.
+    shifted = np.zeros_like(unit.sinus)
+    shift = int(round(45.0 / unit.spacing[2]))
+    shifted[:, :, shift:] = unit.sinus[:, :, :-shift]
+    unit.sinus = shifted
+    scores = nephrometry(unit, {})
+    assert scores["crosses_midline"] is True
+    assert scores["renal"]["L"] == 3
+    assert scores["renal"]["L_range"][1] == 3
+
+
+def test_small_opposite_kidney_without_vessels_withholds_bilateral_totals() -> None:
+    """Regression (fourth review): Unknown side still reported a 98 % 'total kept'."""
+
+    tumor_center = (CENTER_MM[0] - 23.0, CENTER_MM[1], CENTER_MM[2] + 32.0)
+    segmentation, image, affine = phantom(tumor_center, 12.0)
+    segmentation[100:] = 0
+    small = _ellipsoid((120.0, 60.0, 80.0), (12.0, 10.0, 30.0))  # ~15 mL opposite kidney
+    segmentation[small] = int(CanonicalLabel.KIDNEY)
+    resection = build_plan(segmentation, affine, SPACING, image)["summary"]["resection"]
+    assert resection["preserved_total_pct"] is None
+    assert resection["contralateral_status"].startswith("not established")
+    assert resection["preserved_ipsilateral_pct"] < 100.0
