@@ -354,3 +354,60 @@ def test_imported_vessels_may_replace_kidney_but_not_tumour() -> None:
     assert (merged[0] == int(CanonicalLabel.RENAL_ARTERY)).all()  # was discarded before
     assert (merged[1] == int(CanonicalLabel.TUMOR)).all()
     assert (merged[2] == int(CanonicalLabel.RENAL_ARTERY)).all()
+
+
+def test_split_ipsilateral_kidney_is_not_an_opposite_kidney() -> None:
+    """Regression (re-review): a second piece of the left kidney made the plan 'Right'."""
+
+    tumor_center = (CENTER_MM[0] - 23.0, CENTER_MM[1], CENTER_MM[2] + 32.0)
+    segmentation, image, affine = phantom(tumor_center, 12.0)
+    right_kidney = segmentation[100:].copy()
+    segmentation[100:] = 0  # no opposite kidney, no great vessels
+    # Cut the left kidney into an upper and a lower piece (same x range).
+    cut = int(round((CENTER_MM[2] - 20.0) / SPACING[2]))
+    segmentation[:, :, cut : cut + 2][
+        segmentation[:, :, cut : cut + 2] == int(CanonicalLabel.KIDNEY)
+    ] = 0
+    summary = build_plan(segmentation, affine, SPACING, image)["summary"]
+    assert summary["side"] == "Unknown"
+    assert summary["resection"]["contralateral_parenchyma_ml"] == 0.0
+
+    # With the right kidney back, the side is known and only the right kidney counts as
+    # contralateral (the lower left piece does not).
+    segmentation[100:] = right_kidney
+    summary = build_plan(segmentation, affine, SPACING, image)["summary"]
+    assert summary["side"] == "Left"
+    right_ml = float(np.count_nonzero(right_kidney == int(CanonicalLabel.KIDNEY))) * (
+        np.prod(SPACING) / 1000.0
+    )
+    assert summary["resection"]["contralateral_parenchyma_ml"] == pytest.approx(right_ml)
+
+
+def test_kidney_reference_rules() -> None:
+    from renal_explorer.anatomy import kidney_reference_x, kidney_sides
+
+    left = {"x": -80.0, "x_min": -110.0, "x_max": -50.0, "volume": 150.0}
+    right = {"x": 80.0, "x_min": 50.0, "x_max": 110.0, "volume": 140.0}
+    left_piece = {"x": -70.0, "x_min": -95.0, "x_max": -45.0, "volume": 60.0}
+    assert kidney_reference_x([left, right], None) == (0.0, "both kidneys")
+    assert kidney_reference_x([left, left_piece], None) == (None, "unknown")
+    assert kidney_sides([left, left_piece, right], None) == ["Left", "Left", "Right"]
+    assert kidney_sides([left, left_piece], -20.0) == ["Left", "Left"]
+    assert kidney_sides([left], None) == ["Unknown"]
+
+
+def test_legacy_toy_kidneys_still_get_sides() -> None:
+    """Same geometry as test_core.test_components_get_laterality_and_physical_distance."""
+
+    from renal_explorer.analysis import analyze_case
+    from renal_explorer.models import VolumeCase
+
+    segmentation = np.zeros((12, 8, 6), dtype=np.uint8)
+    segmentation[1:4, 2:6, 1:5] = int(CanonicalLabel.KIDNEY)
+    segmentation[8:11, 2:6, 1:5] = int(CanonicalLabel.KIDNEY)
+    segmentation[9:11, 3:5, 2:4] = int(CanonicalLabel.TUMOR)
+    image = np.arange(segmentation.size, dtype=np.float32).reshape(segmentation.shape)
+    case = VolumeCase("t", "c", image, segmentation, (2.0, 1.0, 3.0), np.diag([2.0, 1.0, 3.0, 1.0]))
+    result = analyze_case(case)
+    assert {kidney["laterality"] for kidney in result["kidney_components"]} == {"Left", "Right"}
+    assert result["tumor_components"][0]["nearest_kidney"] == "Right"

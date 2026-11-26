@@ -5,7 +5,7 @@ from typing import Any
 import numpy as np
 from scipy import ndimage as ndi
 
-from .anatomy import great_vessel_midline_x, kidney_sides
+from .anatomy import great_vessel_midline_x, kidney_sides, x_extent
 from .labels import LABEL_NAMES, CanonicalLabel
 from .models import VolumeCase
 
@@ -65,12 +65,14 @@ def component_measurements(
             continue
         centroid_voxel = np.asarray(ndi.center_of_mass(component_mask), dtype=float)
         centroid_world = voxel_to_world(case.affine, centroid_voxel)
+        extent = x_extent(component_mask, case.affine)
         measurements.append(
             {
                 "component": int(component_id),
                 "laterality": "Unknown",  # set anatomically in analyze_case
                 "centroid_voxel": [float(value) for value in centroid_voxel],
                 "centroid_world_mm": [float(value) for value in centroid_world],
+                "x_extent_world_mm": list(extent),
                 **stats,
             }
         )
@@ -95,8 +97,15 @@ def analyze_case(case: VolumeCase) -> dict[str, Any]:
     kidneys = component_measurements(case, segmentation == int(CanonicalLabel.KIDNEY), 0.1)
     tumors = component_measurements(case, segmentation == int(CanonicalLabel.TUMOR), 0.01)
     sides = kidney_sides(
-        [kidney["centroid_world_mm"][0] for kidney in kidneys],
-        [kidney["volume_ml"] for kidney in kidneys],
+        [
+            {
+                "x": kidney["centroid_world_mm"][0],
+                "x_min": kidney["x_extent_world_mm"][0],
+                "x_max": kidney["x_extent_world_mm"][1],
+                "volume": kidney["volume_ml"],
+            }
+            for kidney in kidneys
+        ],
         great_vessel_midline_x(segmentation, case.affine),
     )
     for kidney, side in zip(kidneys, sides):  # noqa: B905

@@ -40,25 +40,54 @@ def side_of(x: float, reference_x: float, tolerance_mm: float = 5.0) -> str:
     return UNKNOWN
 
 
-def kidney_sides(
-    kidney_centroids_x: Sequence[float],
-    kidney_volumes_ml: Sequence[float],
-    midline_x: float | None,
-) -> list[str]:
-    """Sides for kidney components: by the two largest kidneys, else the great vessels.
+def x_extent(mask: np.ndarray, affine: np.ndarray) -> tuple[float, float] | None:
+    """World (RAS) x range of a mask's bounding box, from its eight corners."""
 
-    Never by the image centre, which moves whenever a scan is cropped.
+    if not mask.any():
+        return None
+    bounds = []
+    for axis in range(3):
+        other = tuple(value for value in range(3) if value != axis)
+        indices = np.flatnonzero(np.any(mask, axis=other))
+        bounds.append((indices[0] - 0.5, indices[-1] + 0.5))
+    corners = np.array(np.meshgrid(*bounds, indexing="ij")).reshape(3, -1).T
+    xs = corners @ np.asarray(affine, dtype=float)[0, :3] + float(affine[0, 3])
+    return float(xs.min()), float(xs.max())
+
+
+def kidney_reference_x(
+    components: Sequence[dict[str, float]], midline_x: float | None
+) -> tuple[float | None, str]:
+    """Reference x separating right from left, and how it was found.
+
+    ``components`` are kidney components with keys ``x`` (centroid), ``x_min``, ``x_max``
+    and ``volume``. Priority:
+
+    1. the aorta/IVC midline;
+    2. two substantial kidney components whose x ranges do not overlap (left and right
+       kidneys never overlap left-to-right; pieces of one kidney almost always do);
+    3. nothing: laterality is Unknown. A wrong side is worse than no side.
     """
 
-    count = len(kidney_centroids_x)
-    if count == 0:
-        return []
-    order = np.argsort(np.asarray(kidney_volumes_ml))[::-1]
-    if count >= 2:
-        first, second = kidney_centroids_x[order[0]], kidney_centroids_x[order[1]]
-        if abs(first - second) >= 30.0:  # two separate kidneys, not fragments of one
-            reference = 0.5 * (first + second)
-            return [side_of(x, reference, tolerance_mm=0.0) for x in kidney_centroids_x]
     if midline_x is not None:
-        return [side_of(x, midline_x) for x in kidney_centroids_x]
-    return [UNKNOWN] * count
+        return midline_x, "great vessels"
+    if len(components) < 2:
+        return None, "unknown"
+    ordered = sorted(components, key=lambda item: item["volume"], reverse=True)
+    largest = ordered[0]
+    for other in ordered[1:]:
+        if other["volume"] < 0.25 * largest["volume"]:
+            break
+        if other["x_min"] > largest["x_max"] or other["x_max"] < largest["x_min"]:
+            return 0.5 * (largest["x"] + other["x"]), "both kidneys"
+    return None, "unknown"
+
+
+def kidney_sides(
+    components: Sequence[dict[str, float]], midline_x: float | None
+) -> list[str]:
+    reference, source = kidney_reference_x(components, midline_x)
+    if reference is None:
+        return [UNKNOWN] * len(components)
+    tolerance = 5.0 if source == "great vessels" else 0.0
+    return [side_of(item["x"], reference, tolerance) for item in components]

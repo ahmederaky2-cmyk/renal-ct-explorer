@@ -5,6 +5,7 @@ SimpleITK is imported lazily so the public demo (which never sees DICOM) does no
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -84,14 +85,31 @@ def read_series_index(raw_dir: Path) -> dict[str, dict[str, str]]:
         return {}
 
 
+def source_fingerprint(source: Path) -> str:
+    """Identity of an inbox item: inode, size and mtime of it and of every file inside.
+
+    A different study later saved under the same name gets a different fingerprint.
+    """
+
+    digest = hashlib.sha256()
+    entries = [source] if source.is_file() else [source, *sorted(source.rglob("*"))]
+    for entry in entries:
+        info = entry.lstat()
+        relative = "." if entry == source else str(entry.relative_to(source))
+        digest.update(f"{relative}|{info.st_ino}|{info.st_size}|{info.st_mtime_ns}\n".encode())
+    return digest.hexdigest()
+
+
 def record_inbox_source(raw_dir: Path, source: Path) -> None:
-    (raw_dir / SOURCE_RECORD).write_text(json.dumps({"path": str(source)}))
+    record = {"path": str(source), "fingerprint": source_fingerprint(source)}
+    (raw_dir / SOURCE_RECORD).write_text(json.dumps(record))
 
 
 def consume_inbox_source(raw_dir: Path, inbox_root: Path) -> bool:
     """Delete the original inbox study once its conversion has succeeded.
 
-    Only a direct child of the inbox folder is ever deleted.
+    Only a direct child of the inbox folder is ever deleted, and only if it is still the
+    very item that was imported (same fingerprint).
     """
 
     try:
@@ -101,6 +119,8 @@ def consume_inbox_source(raw_dir: Path, inbox_root: Path) -> bool:
     source = Path(record.get("path", ""))
     try:
         if source.resolve().parent != inbox_root.resolve() or source.is_symlink():
+            return False
+        if not source.exists() or source_fingerprint(source) != record.get("fingerprint"):
             return False
     except OSError:
         return False

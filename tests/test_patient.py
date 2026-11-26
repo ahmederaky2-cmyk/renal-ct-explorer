@@ -352,3 +352,35 @@ def test_failed_conversion_keeps_inbox_study(tmp_path: Path, monkeypatch) -> Non
     assert case.status()["state"] == "failed"
     assert study.exists()
     assert not case.raw_dir.exists()
+
+
+def test_inbox_item_replaced_under_same_name_is_not_deleted(tmp_path: Path) -> None:
+    """Regression (re-review): a new study reusing the imported pathname was deleted."""
+
+    import os
+
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    study = inbox / "study.zip"
+    study.write_bytes(b"first study")
+    record_inbox_source(raw, study)
+    study.unlink()
+    study.write_bytes(b"second, different study")
+    os.utime(study, ns=(1, 1))
+    assert consume_inbox_source(raw, inbox) is False
+    assert study.read_bytes() == b"second, different study"
+
+    folder = inbox / "folder_study"
+    folder.mkdir()
+    (folder / "IM1").write_bytes(b"a")
+    record_inbox_source(raw, folder)
+    (folder / "IM2").write_bytes(b"added later")
+    assert consume_inbox_source(raw, inbox) is False and folder.exists()
+
+    untouched = inbox / "untouched_study"
+    untouched.mkdir()
+    (untouched / "IM1").write_bytes(b"a")
+    record_inbox_source(raw, untouched)
+    assert consume_inbox_source(raw, inbox) is True and not untouched.exists()

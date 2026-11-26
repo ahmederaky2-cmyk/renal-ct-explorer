@@ -16,7 +16,13 @@ from typing import Any
 import numpy as np
 from scipy import ndimage as ndi
 
-from .anatomy import UNKNOWN, great_vessel_midline_x, side_of
+from .anatomy import (
+    UNKNOWN,
+    great_vessel_midline_x,
+    kidney_reference_x,
+    side_of,
+    x_extent,
+)
 from .labels import CanonicalLabel
 
 STRUCTURE_18 = ndi.generate_binary_structure(rank=3, connectivity=2)
@@ -280,18 +286,28 @@ def extract_renal_unit(
             raise PlanningError("No kidney parenchyma was found for this tumour.")
         unit |= renal_components == best_id
 
-    contralateral_voxels = 0
-    contralateral_centroids: list[tuple[int, np.ndarray]] = []
+    first_affine = np.asarray(affine, dtype=float).copy()
+    first_affine[:3, 3] = first_affine[:3, :3] @ first_offset + first_affine[:3, 3]
+
+    def describe(kidney_part: np.ndarray) -> dict[str, float]:
+        centroid = np.array(ndi.center_of_mass(kidney_part))
+        x_min, x_max = x_extent(kidney_part, first_affine)
+        return {
+            "x": float(first_affine[0, :3] @ centroid + first_affine[0, 3]),
+            "x_min": x_min,
+            "x_max": x_max,
+            "volume": float(np.count_nonzero(kidney_part)) * voxel_ml,
+        }
+
+    unit_description = describe(unit & kidney_first)
+    others: list[dict[str, float]] = []
     for component_id in range(1, renal_count + 1):
         component = renal_components == component_id
         if np.any(component & unit):
             continue
-        kidney_voxels = int(np.count_nonzero(component & kidney_first))
-        if kidney_voxels * voxel_ml >= MIN_CONTRALATERAL_ML:
-            contralateral_voxels += kidney_voxels
-            contralateral_centroids.append(
-                (kidney_voxels, np.array(ndi.center_of_mass(component & kidney_first)))
-            )
+        kidney_part = component & kidney_first
+        if np.count_nonzero(kidney_part) * voxel_ml >= MIN_CONTRALATERAL_ML:
+            others.append(describe(kidney_part))
 
     # Working crop: renal unit plus a physical margin, clipped to the volume.
     unit_bounds = _bounds(unit)
@@ -336,17 +352,23 @@ def extract_renal_unit(
     kidney_work = (labels == int(CanonicalLabel.KIDNEY)) & unit_work
     if not kidney_work.any():
         raise PlanningError("No kidney parenchyma was found for this tumour.")
-    # Laterality from anatomy (opposite kidney, else aorta/IVC), never the image centre.
-    kidney_world = work_affine[:3, :3] @ np.array(ndi.center_of_mass(kidney_work)) + work_affine[
-        :3, 3
-    ]
-    if contralateral_centroids:
-        _voxels, other_voxel = max(contralateral_centroids, key=lambda item: item[0])
-        other_world = np.asarray(affine, dtype=float) @ np.append(other_voxel + first_offset, 1.0)
-        side = side_of(float(kidney_world[0]), 0.5 * (kidney_world[0] + other_world[0]), 0.0)
+    # Laterality from anatomy (aorta/IVC, else a non-overlapping opposite kidney), never
+    # the image centre. A second piece of the same kidney is not an opposite kidney.
+    reference, reference_source = kidney_reference_x(
+        [unit_description, *others], great_vessel_midline_x(segmentation, affine)
+    )
+    contralateral_ml = 0.0
+    if reference is None:
+        side = UNKNOWN
     else:
-        midline = great_vessel_midline_x(segmentation, affine)
-        side = side_of(float(kidney_world[0]), midline) if midline is not None else UNKNOWN
+        tolerance = 5.0 if reference_source == "great vessels" else 0.0
+        side = side_of(unit_description["x"], reference, tolerance)
+        if side != UNKNOWN:
+            contralateral_ml = sum(
+                other["volume"]
+                for other in others
+                if side_of(other["x"], reference, tolerance) not in (side, UNKNOWN)
+            )
 
     renal_unit = RenalUnit(
         tumor_index=tumor_index,
@@ -366,7 +388,7 @@ def extract_renal_unit(
             if image is not None
             else None
         ),
-        contralateral_parenchyma_ml=contralateral_voxels * voxel_ml,
+        contralateral_parenchyma_ml=contralateral_ml,
     )
     _derive_geometry(renal_unit)
     return renal_unit
