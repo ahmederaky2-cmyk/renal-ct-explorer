@@ -19,8 +19,20 @@ st.set_page_config(
 
 from renal_explorer.analysis import analyze_case, histogram_table  # noqa: E402
 from renal_explorer.datasets import DATASETS, DatasetError, get_adapter  # noqa: E402
-from renal_explorer.labels import LABEL_COLORS, LABEL_NAMES, CanonicalLabel  # noqa: E402
+from renal_explorer.labels import (  # noqa: E402
+    LABEL_COLORS,
+    LABEL_NAMES,
+    RENAL_LABELS,
+    CanonicalLabel,
+)
 from renal_explorer.models import CaseFiles  # noqa: E402
+from renal_explorer.patient_ui import (  # noqa: E402
+    PATIENT_MODE,
+    render_correction_panel,
+    render_patient_workspace,
+    require_password,
+    select_patient_case,
+)
 from renal_explorer.plan_ui import render_plan_tab  # noqa: E402
 from renal_explorer.prediction_packages import (  # noqa: E402
     PredictionPackageError,
@@ -268,7 +280,7 @@ def build_3d_figure(
                 k=faces[:, 2],
                 name=LABEL_NAMES[label],
                 color=f"rgb({red},{green},{blue})",
-                opacity=LABEL_OPACITY[label],
+                opacity=LABEL_OPACITY.get(label, 0.35),
                 flatshading=False,
                 lighting={"ambient": 0.55, "diffuse": 0.75, "specular": 0.25},
                 hovertemplate=f"{LABEL_NAMES[label]}<extra></extra>",
@@ -381,18 +393,37 @@ def render_missing_dataset(adapter, dataset_root: str) -> None:
 
 
 def main() -> None:
-    dataset_keys = list(DATASETS)
+    require_password()
+    dataset_keys = [key for key in DATASETS if key != "patient"]
     missing_server_dataset = False
+    patient_case_selected = False
+    access_modes = ("Online demo", "Server datasets") + (
+        ("Patient cases",) if PATIENT_MODE else ()
+    )
+    if PATIENT_MODE:
+        default_mode = 2
+    else:
+        default_mode = 1 if "RENAL_DATA_ROOT" in os.environ else 0
     with st.sidebar:
         st.title("Dataset")
         access_mode = st.radio(
             "Data access",
-            ("Online demo", "Server datasets"),
-            index=1 if "RENAL_DATA_ROOT" in os.environ else 0,
+            access_modes,
+            index=default_mode,
             help="Online demo retrieves only the selected public KiTS23 case.",
         )
 
-        if access_mode == "Online demo":
+        if access_mode == "Patient cases":
+            dataset_key = "patient"
+            adapter = get_adapter(dataset_key)
+            selection = select_patient_case()
+            if selection is None:
+                case_id = image_path = segmentation_path = ""
+                dataset_root = ""
+            else:
+                case_id, image_path, segmentation_path, dataset_root = selection
+                patient_case_selected = True
+        elif access_mode == "Online demo":
             dataset_key = "kits23"
             adapter = get_adapter(dataset_key)
             case_id = st.selectbox(
@@ -442,6 +473,13 @@ def main() -> None:
 
         st.caption(f"License: {adapter.info.license_name}")
         st.markdown(f"[Official source]({adapter.info.source_url})")
+
+    if access_mode == "Patient cases":
+        render_patient_workspace(expanded=not patient_case_selected)
+        if not patient_case_selected:
+            st.stop()
+        with st.sidebar:
+            render_correction_panel(case_id)
 
     if missing_server_dataset:
         render_missing_dataset(adapter, dataset_root)
@@ -572,7 +610,9 @@ def main() -> None:
             selected_names = st.multiselect(
                 "Structures",
                 [LABEL_NAMES[label] for label in available_labels],
-                default=[LABEL_NAMES[label] for label in available_labels],
+                default=[
+                    LABEL_NAMES[label] for label in available_labels if label in RENAL_LABELS
+                ],
             )
             visible_labels = [
                 label for label in available_labels if LABEL_NAMES[label] in selected_names

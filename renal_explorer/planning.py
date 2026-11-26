@@ -40,6 +40,13 @@ DISTANCE_TARGETS = (
     ("Renal vein", CanonicalLabel.RENAL_VEIN),
     ("Aorta", CanonicalLabel.AORTA),
     ("Inferior vena cava", CanonicalLabel.IVC),
+    ("Duodenum", CanonicalLabel.DUODENUM),
+    ("Colon", CanonicalLabel.COLON),
+    ("Pancreas", CanonicalLabel.PANCREAS),
+    ("Spleen", CanonicalLabel.SPLEEN),
+    ("Liver", CanonicalLabel.LIVER),
+    ("Adrenal gland", CanonicalLabel.ADRENAL),
+    ("Psoas", CanonicalLabel.PSOAS),
 )
 
 

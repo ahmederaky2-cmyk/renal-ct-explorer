@@ -241,6 +241,30 @@ class FLARE22Adapter(SplitDirectoryAdapter):
     }
 
 
+class PatientCasesAdapter(CaseDirectoryAdapter):
+    """Cases produced by ``renal_explorer.patient`` (labels already canonical)."""
+
+    info = DatasetInfo(
+        key="patient",
+        name="Patient cases (private)",
+        source_url="https://github.com/ahmederaky2-cmyk/renal-ct-explorer",
+        license_name="Institutional data — do not redistribute",
+        description=(
+            "Pseudonymised cases uploaded as DICOM and segmented automatically on this server. "
+            "Automatic labels require review before use."
+        ),
+        expected_layout="PN-xxxxxxxx/imaging.nii.gz + segmentation.nii.gz",
+    )
+    label_mapping = {int(label): label for label in CanonicalLabel if int(label) != 0}
+
+    def list_cases(self, root: Path) -> list[CaseFiles]:
+        return [
+            case
+            for case in super().list_cases(root)
+            if case.case_id.startswith("PN-") and case.segmentation_path is not None
+        ]
+
+
 DATASETS: dict[str, type[DatasetAdapter]] = {
     adapter.info.key: adapter
     for adapter in (
@@ -250,6 +274,7 @@ DATASETS: dict[str, type[DatasetAdapter]] = {
         AbdomenAtlasAdapter,
         AMOS22Adapter,
         FLARE22Adapter,
+        PatientCasesAdapter,
     )
 }
 

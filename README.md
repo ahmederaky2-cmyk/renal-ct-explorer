@@ -53,6 +53,21 @@ case ID, source CT SHA-256, dimensions, affine, labels, model source, and resear
 are checked by Streamlit before the artery/vein overlay is accepted. Imported predictions are
 kept separate from dataset annotations in measurements and exports.
 
+## Private patient workflow (Mac)
+
+With `RENAL_PATIENT_MODE=1` the app gains a **Patient cases** mode: upload a DICOM ZIP (or drop
+it in an inbox folder), confirm which series is which phase, and a background job converts
+the series, segments them automatically, and produces a planning case. Steps:
+TotalSegmentator (MLX on Apple Silicon or PyTorch) for kidneys, great vessels and nearby
+organs; AbdomenAtlasNet-Tumors (nnU-Net v2, CC BY-NC 4.0) for kidney tumours; rigid
+registration of arterial and excretory phases; collecting system from the excretory phase;
+renal artery/vein from a validated KiPA22 model when installed. Labels can be corrected in
+3D Slicer and uploaded again. Raw DICOM is deleted after conversion, and cases are
+pseudonymised and purged automatically.
+
+Setup, remote access (Cloudflare Tunnel + Access or Tailscale), data protection notes and
+settings: [`docs/mac-deployment.md`](docs/mac-deployment.md).
+
 ## Surgical plan tab (research prototype)
 
 The **Surgical plan** tab turns the labelmaps into a partial nephrectomy planning summary for
