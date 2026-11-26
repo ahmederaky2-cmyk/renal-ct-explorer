@@ -6,6 +6,7 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -351,9 +352,10 @@ def build_prediction_package(
         np.rint(np.asanyarray(native_nii.dataobj)).astype(np.uint8), native_nii.affine
     )
     compact.set_data_dtype(np.uint8)
-    compact_path = output.parent / f"{case_id}_vessels_uint8.nii.gz"
+    staging = tempfile.TemporaryDirectory(prefix="banet-package-")
+    compact_path = Path(staging.name) / "vessels.nii.gz"  # intermediate, never left behind
     nib.save(compact, str(compact_path))
-    with ZipFile(output, "w") as archive:
+    with staging, ZipFile(output, "w") as archive:
         archive.write(compact_path, "vessels.nii.gz", compress_type=ZIP_STORED)
         archive.writestr(
             "provenance.json",

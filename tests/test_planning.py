@@ -480,7 +480,7 @@ def test_midline_crossing_tumour_is_l3_even_outside_polar_lines() -> None:
     scores = nephrometry(unit, {})
     assert scores["crosses_midline"] is True
     assert scores["renal"]["L"] == 3
-    assert scores["renal"]["L_range"][1] == 3
+    assert scores["renal"]["L_range"] == [3, 3]
 
 
 def test_small_opposite_kidney_without_vessels_withholds_bilateral_totals() -> None:
@@ -493,5 +493,6 @@ def test_small_opposite_kidney_without_vessels_withholds_bilateral_totals() -> N
     segmentation[small] = int(CanonicalLabel.KIDNEY)
     resection = build_plan(segmentation, affine, SPACING, image)["summary"]["resection"]
     assert resection["preserved_total_pct"] is None
+    assert resection["contralateral_parenchyma_ml"] is None
     assert resection["contralateral_status"].startswith("not established")
     assert resection["preserved_ipsilateral_pct"] < 100.0

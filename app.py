@@ -20,6 +20,7 @@ st.set_page_config(
 
 from renal_explorer.analysis import analyze_case, histogram_table  # noqa: E402
 from renal_explorer.datasets import DATASETS, DatasetError, get_adapter  # noqa: E402
+from renal_explorer.identity import file_signature  # noqa: E402
 from renal_explorer.labels import (  # noqa: E402
     LABEL_COLORS,
     LABEL_NAMES,
@@ -132,8 +133,8 @@ def load_case_bundle(
     case_id: str,
     image_path: str,
     segmentation_path: str,
-    image_signature: tuple[int, int],
-    segmentation_signature: tuple[int, int] | None,
+    image_signature: tuple[int, ...],
+    segmentation_signature: tuple[int, ...] | None,
     target_spacing_mm: float | None = None,
 ):
     del image_signature, segmentation_signature
@@ -166,7 +167,7 @@ def cached_label_surface(
 def cached_candidate_vessels(
     dataset_key: str,
     case_id: str,
-    image_signature: tuple[int, int],
+    image_signature: tuple[int, ...],
     segmentation_signature: str,
     sensitivity: str,
     detail: str,
@@ -201,7 +202,7 @@ def cached_vessel_model_bundle(
 def cached_ml_vessels(
     dataset_key: str,
     case_id: str,
-    image_signature: tuple[int, int],
+    image_signature: tuple[int, ...],
     segmentation_signature: str,
     model_sha256: str,
     _image: np.ndarray,
@@ -225,7 +226,7 @@ def cached_ml_vessels(
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
-def cached_file_sha256(path: str, signature: tuple[int, int]) -> str:
+def cached_file_sha256(path: str, signature: tuple[int, ...]) -> str:
     del signature
     return sha256_file(Path(path))
 
@@ -344,13 +345,6 @@ def build_3d_figure(
         uirevision="renal-3d",
     )
     return figure
-
-
-def file_signature(path: str) -> tuple[int, int] | None:
-    if not path:
-        return None
-    stat = Path(path).stat()
-    return stat.st_size, stat.st_mtime_ns
 
 
 def root_default(dataset_key: str) -> str:
