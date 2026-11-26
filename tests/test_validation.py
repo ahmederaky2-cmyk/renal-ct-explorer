@@ -172,3 +172,37 @@ def test_run_validation_end_to_end_with_fake_model(tmp_path: Path, monkeypatch) 
     # A rerun skips finished cases (resume across sessions).
     assert run_validation.main() == 0
     assert len(run_validation.read_results(out / "results.csv")) == 2
+
+
+def test_failed_cases_are_counted_excluded_and_retried(tmp_path: Path, monkeypatch) -> None:
+    """Regression (review): an empty-message failure was reported as 'failed: 0'."""
+
+    run_validation = _load("run_validation")
+    attempts = {"count": 0}
+
+    def flaky(args, case_id):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("")  # e.g. a multiprocessing crash with no message
+        return {"case": case_id, "status": "ok", "dataset": "kits23", "tumor_dice": 0.9,
+                "renal_mass_dice": 0.95, "true_lesions": 1, "found": 1,
+                "false_positive_lesions": 0, "missed_lesion_diameters_mm": "[]",
+                "main_tumor_matched": True}
+
+    monkeypatch.setattr(run_validation, "evaluate_case", flaky)
+    out = tmp_path / "out"
+    argv = ["run_validation", "--dataset", "kits23", "--cases", "case_00001",
+            "--out", str(out), "--work", str(tmp_path / "work")]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    assert run_validation.main() == 1
+    rows = run_validation.read_results(out / "results.csv")
+    assert rows[0]["status"] == "failed" and rows[0]["error"].startswith("RuntimeError")
+    summary = run_validation.summarise(rows)
+    assert (summary["succeeded"], summary["failed"]) == (0, 1)
+    assert "1 case(s) failed" in (out / "report.md").read_text()
+
+    assert run_validation.main() == 0  # resume retries the failed case
+    rows = run_validation.read_results(out / "results.csv")
+    assert len(rows) == 1 and rows[0]["status"] == "ok"
+    assert run_validation.summarise(rows)["tumor_dice"]["n"] == 1

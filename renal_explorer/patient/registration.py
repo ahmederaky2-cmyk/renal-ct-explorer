@@ -43,11 +43,14 @@ def register_phase(
     fixed = sitk.ReadImage(str(fixed_path), sitk.sitkFloat32)
     moving = sitk.ReadImage(str(moving_path), sitk.sitkFloat32)
 
+    def configure_metric(method) -> None:
+        method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+        method.SetMetricSamplingStrategy(method.RANDOM)
+        method.SetMetricSamplingPercentage(0.05, seed=7)
+        method.SetInterpolator(sitk.sitkLinear)
+
     registration = sitk.ImageRegistrationMethod()
-    registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
-    registration.SetMetricSamplingStrategy(registration.RANDOM)
-    registration.SetMetricSamplingPercentage(0.05, seed=7)
-    registration.SetInterpolator(sitk.sitkLinear)
+    configure_metric(registration)
     registration.SetOptimizerAsRegularStepGradientDescent(
         learningRate=2.0, minStep=1e-3, numberOfIterations=200, relaxationFactor=0.6
     )
@@ -56,6 +59,7 @@ def register_phase(
     registration.SetSmoothingSigmasPerLevel([2.0, 1.0, 0.0])
     registration.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
 
+    mask = None
     if roi_mask is not None and roi_affine is not None and roi_mask.any():
         import tempfile
 
@@ -75,12 +79,23 @@ def register_phase(
         sitk.CenteredTransformInitializerFilter.GEOMETRY,
     )
     registration.SetInitialTransform(initial, inPlace=False)
-    metric_before = registration.MetricEvaluate(fixed, moving)
     try:
         transform = registration.Execute(fixed, moving)
     except RuntimeError as exc:
         raise RegistrationError(f"Registration failed: {exc}") from exc
-    metric_after = registration.GetMetricValue()
+
+    def evaluate(candidate) -> float:
+        """Same metric, mask and sampling seed for before and after (comparable values)."""
+
+        probe = sitk.ImageRegistrationMethod()
+        configure_metric(probe)
+        if mask is not None:
+            probe.SetMetricFixedMask(mask)
+        probe.SetInitialTransform(candidate)
+        return float(probe.MetricEvaluate(fixed, moving))
+
+    metric_before = evaluate(initial)
+    metric_after = evaluate(transform)
 
     resampled = sitk.Resample(moving, fixed, transform, sitk.sitkLinear, -1024.0)
     sitk.WriteImage(sitk.Cast(resampled, sitk.sitkInt16), str(output_path), useCompression=True)
@@ -93,7 +108,8 @@ def register_phase(
         "method": "Rigid (Euler 3D), Mattes MI, renal ROI, 3-level pyramid",
         "metric_before": float(metric_before),
         "metric_after": float(metric_after),
-        "improved": bool(metric_after < metric_before),
+        # Mattes MI is negative; lower is better. Require a real, not numerical, change.
+        "improved": bool(metric_after < metric_before - 1e-3 * abs(metric_before)),
         "translation_mm": [float(value) for value in translation],
         "iterations": int(registration.GetOptimizerIteration()),
     }

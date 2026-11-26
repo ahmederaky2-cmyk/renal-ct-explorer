@@ -73,6 +73,12 @@ def _fmt(value: Any, digits: int = 1, suffix: str = "") -> str:
     return f"{value}{suffix}"
 
 
+def _n_range(renal: dict[str, Any]) -> str:
+    low, high = renal.get("N_range") or (1, 3)
+    estimate = renal.get("N_estimate")
+    return f"{low}-{high}" + (f" (est. {estimate}, {renal.get('N_source')})" if estimate else "")
+
+
 def plan_report_pdf(
     summary: dict[str, Any],
     case_label: str,
@@ -153,7 +159,9 @@ def plan_report_pdf(
                     "R.E.N.A.L.",
                     renal["score"],
                     renal["complexity"],
-                    f"R{renal['R']} E{renal['E']} N{_fmt(renal['N'])} A:{renal['A']} "
+                    f"R{renal['R']} E{renal['E']} "
+                    f"N{_fmt(renal['N']) if renal['N'] is not None else _n_range(renal)} "
+                    f"A:{renal['A']} "
                     f"L{renal['L']} h:{_fmt(renal['hilar'])}",
                 ],
                 [
@@ -235,11 +243,18 @@ def plan_report_pdf(
                 ]
             ),
             Paragraph(
-                f"Renal arteries reaching kidney: {territories['renal_artery_count']}. "
-                f"Selective clamp of feeding branches: ischaemic parenchyma "
-                f"{_fmt(territories['selective_clamp_ischemic_ml'])} mL "
-                f"({_fmt(territories['selective_clamp_ischemic_pct'], 0)} %) vs main artery "
-                f"{_fmt(territories['main_clamp_ischemic_ml'])} mL. {territories['method']}.",
+                (
+                    f"Renal arteries reaching kidney: {territories['renal_artery_count']}. "
+                    f"Selective clamp of feeding branches: ischaemic parenchyma roughly "
+                    f"{_fmt(territories['selective_clamp_ischemic_ml'])} mL "
+                    f"({_fmt(territories['selective_clamp_ischemic_pct'], 0)} %) vs main artery "
+                    f"{_fmt(territories['main_clamp_ischemic_ml'])} mL. "
+                    if territories.get("ischemia_estimate_reliable")
+                    else "Ischaemic-volume estimate withheld: "
+                    + " ".join(territories.get("warnings", []))
+                    + " "
+                )
+                + f"{territories['method']}.",
                 styles["Normal"],
             ),
         ]

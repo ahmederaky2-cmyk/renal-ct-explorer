@@ -78,7 +78,9 @@ def planning_segmentation(case, imported_prediction) -> np.ndarray:
         return case.segmentation
     merged = case.segmentation.copy()
     prediction = imported_prediction.segmentation
-    fill = (merged == 0) & (prediction > 0)
+    # Predicted vessels may replace background or kidney (the sinus/hilum often carries a
+    # kidney label) but never tumour, cyst or other structures.
+    fill = (prediction > 0) & np.isin(merged, (0, int(CanonicalLabel.KIDNEY)))
     merged[fill] = prediction[fill]
     return merged
 
@@ -213,10 +215,18 @@ def _score_tables(summary: dict[str, Any]) -> None:
     scores = summary["scores"]
     renal = scores["renal"]
     padua = scores["padua"]
-    nearness = summary["distances"].get("Collecting system") or summary["distances"].get(
-        "Renal sinus"
+    renal_n = summary["scores"]["renal"]
+    nearness_text = (
+        f"{renal_n['N_gap_mm']:.1f} mm to {renal_n['N_source']}"
+        if renal_n.get("N_gap_mm") is not None
+        else "not assessable"
     )
-    nearness_text = f"{nearness['gap_mm']:.1f} mm" if nearness else "not assessable"
+    if renal_n["N"] is None:
+        low, high = renal_n["N_range"]
+        estimate = renal_n.get("N_estimate")
+        n_text = f"{low}–{high}" + (f" (est. {estimate})" if estimate is not None else "")
+    else:
+        n_text = str(renal_n["N"])
     left, right = st.columns(2)
     with left:
         st.markdown("**R.E.N.A.L. components**")
@@ -232,7 +242,7 @@ def _score_tables(summary: dict[str, Any]) -> None:
                     (
                         "N – nearness",
                         nearness_text,
-                        renal["N"] if renal["N"] is not None else "?",
+                        n_text,
                     ),
                     (
                         "A – face",
@@ -260,7 +270,16 @@ def _score_tables(summary: dict[str, Any]) -> None:
         st.dataframe(
             pd.DataFrame(
                 [
-                    (name, "?" if value is None else value)
+                    (
+                        name,
+                        (
+                            f"? (est. {padua['renal_sinus_estimate']})"
+                            if name == "Renal sinus" and padua.get("renal_sinus_estimate")
+                            else "?"
+                        )
+                        if value is None
+                        else value,
+                    )
                     for name, value in padua["items"].items()
                 ]
                 + [("Face", padua["face"])],
@@ -440,13 +459,18 @@ def render_plan_tab(
             hide_index=True,
             width="stretch",
         )
-        st.info(
-            f"{territories['renal_artery_count']} renal arter"
-            f"{'y' if territories['renal_artery_count'] == 1 else 'ies'} reach the kidney. "
-            f"Selective clamping of {', '.join(territories['feeding_branches']) or '—'} would "
-            f"leave {territories['selective_clamp_ischemic_pct']:.0f} % of parenchyma ischaemic "
-            "versus 100 % with main-artery clamping."
-        )
+        for warning in territories.get("warnings", []):
+            st.warning(warning)
+        if territories.get("ischemia_estimate_reliable"):
+            st.info(
+                f"{territories['renal_artery_count']} renal arter"
+                f"{'y' if territories['renal_artery_count'] == 1 else 'ies'} reach the kidney. "
+                f"Selective clamping of {', '.join(territories['feeding_branches']) or '—'} "
+                f"would leave roughly {territories['selective_clamp_ischemic_pct']:.0f} % of "
+                "parenchyma ischaemic versus 100 % with main-artery clamping (approximation)."
+            )
+        else:
+            st.caption("Ischaemic-volume estimate withheld: the arterial tree looks incomplete.")
         st.caption(territories["method"] + ".")
     elif not has_artery:
         st.caption(

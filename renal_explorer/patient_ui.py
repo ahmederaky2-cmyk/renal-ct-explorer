@@ -101,8 +101,19 @@ def select_patient_case() -> tuple[str, str, str, str] | None:
 # --------------------------------------------------------------------------------------
 
 
-def _ingest(case, source: Path) -> None:
-    from .patient.dicom_intake import list_series, safe_extract_zip
+def _ingest(case, source: Path, inbox_source: Path | None = None) -> bool:
+    """Copy/extract a study into the case. True when usable CT series were found.
+
+    An inbox original is never deleted here: the worker deletes it only after the
+    DICOM-to-NIfTI conversion has succeeded.
+    """
+
+    from .patient.dicom_intake import (
+        list_series,
+        record_inbox_source,
+        safe_extract_zip,
+        write_series_index,
+    )
 
     if source.is_dir():
         shutil.copytree(source, case.raw_dir, dirs_exist_ok=True)
@@ -112,9 +123,12 @@ def _ingest(case, source: Path) -> None:
     if not series:
         case.discard_raw()
         case.update_status(state="failed", error="No CT series with ≥20 slices found.")
-        return
-    case.write_request({"series": [item.public() for item in series]})
+        return False
+    if inbox_source is not None:
+        record_inbox_source(case.raw_dir, inbox_source)
+    case.write_request({"series": write_series_index(case.raw_dir, series)})
     case.update_status(step="Choose series and phases")
+    return True
 
 
 def _upload_panel() -> None:
@@ -160,14 +174,15 @@ def _upload_panel() -> None:
             st.info("The inbox is empty.")
         else:
             item = st.selectbox("Inbox item", items, format_func=lambda path: path.name)
-            remove = st.checkbox("Delete from inbox after import", value=True)
+            remove = st.checkbox(
+                "Delete from inbox once converted successfully", value=True
+            )
             if st.button("Import from inbox", type="primary"):
                 case = store.create_case(alias)
                 try:
                     with st.spinner("Reading DICOM series…"):
-                        _ingest(case, item)
-                    if remove:
-                        shutil.rmtree(item) if item.is_dir() else item.unlink()
+                        if not _ingest(case, item, item if remove else None):
+                            st.error("No usable CT series found; the inbox item was kept.")
                 except Exception as exc:  # noqa: BLE001
                     case.discard_raw()
                     case.update_status(state="failed", error=str(exc)[:300])
@@ -176,20 +191,22 @@ def _upload_panel() -> None:
 
 
 def _series_selection(case) -> None:
-    from .patient.dicom_intake import SeriesInfo, default_assignment
+    from .patient.dicom_intake import SeriesInfo, default_assignment, read_series_index
     from .patient.worker import launch
 
     request = case.request()
     series = request.get("series", [])
+    # Descriptions are read from raw/ (deleted after conversion), never from request.json.
+    private = read_series_index(case.raw_dir)
     st.markdown(f"**{_case_label(case)} — choose series**")
     st.dataframe(
         pd.DataFrame(
             [
                 {
-                    "Description": item["description"],
+                    "Series": item["handle"],
+                    "Description": private.get(item["handle"], {}).get("description", ""),
                     "Slices": item["slices"],
                     "Thickness (mm)": item["slice_thickness_mm"],
-                    "Time": item["series_time"],
                     "Guessed phase": item["phase_guess"],
                 }
                 for item in series
@@ -199,17 +216,29 @@ def _series_selection(case) -> None:
         width="stretch",
     )
     defaults = default_assignment(
-        [SeriesInfo(**{**item, "files": []}) for item in series]
+        [
+            SeriesInfo(
+                series_uid=item["handle"],
+                description="",
+                slices=item["slices"],
+                slice_thickness_mm=item["slice_thickness_mm"],
+                series_time="",
+                phase_guess=item["phase_guess"],
+                files=[],
+            )
+            for item in series
+        ]
     )
-    by_uid = {item["series_uid"]: item for item in series}
-    options = [""] + [item["series_uid"] for item in series]
+    by_handle = {item["handle"]: item for item in series}
+    options = [""] + [item["handle"] for item in series]
 
-    def describe(uid: str) -> str:
-        if not uid:
+    def describe(handle: str) -> str:
+        if not handle:
             return "— not available —"
-        item = by_uid[uid]
+        item = by_handle[handle]
+        description = private.get(handle, {}).get("description") or "unnamed"
         return (
-            f"{item['description'] or 'unnamed'} · {item['slices']} sl · "
+            f"{handle} · {description} · {item['slices']} sl · "
             f"{item['slice_thickness_mm']} mm"
         )
 

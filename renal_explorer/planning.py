@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 from scipy import ndimage as ndi
 
+from .anatomy import UNKNOWN, great_vessel_midline_x, side_of
 from .labels import CanonicalLabel
 
 STRUCTURE_18 = ndi.generate_binary_structure(rank=3, connectivity=2)
@@ -24,11 +25,12 @@ CROP_MARGIN_MM = 30.0
 FINEST_WORK_SPACING_MM = 0.6
 ENVELOPE_CLOSING_MM = 15.0
 SINUS_MIN_DEPTH_MM = 4.0
-SINUS_FAT_URINE_HU = (50.0, 500.0)
+SINUS_FAT_HU = -30.0  # fat inside a kidney label; medulla and urine overlap at 0-50 HU
 MIN_TUMOR_ML = 0.01
 MIN_CONTRALATERAL_ML = 10.0
 CONTACT_TOLERANCE_MM = 1.0
 BRANCH_MIN_LENGTH_MM = 8.0
+ROOT_MIN_EXTRARENAL_MM = 10.0  # a renal (or accessory) artery must start outside the kidney
 FEEDING_BRANCH_MIN_TUMOR_FRACTION = 0.05
 
 RENAL_RISK = ((4, 6, "Low"), (7, 9, "Intermediate"), (10, 12, "High"))
@@ -149,6 +151,12 @@ def _risk(total: int, table) -> str:
         if low <= total <= high:
             return name
     return "—"
+
+
+def nearness_points(gap_mm: float) -> int:
+    """R.E.N.A.L. N: ≥7 mm = 1, >4 to <7 mm = 2, ≤4 mm = 3."""
+
+    return 1 if gap_mm >= 7.0 else 2 if gap_mm > 4.0 else 3
 
 
 def _risk_range(low: int, high: int, table) -> str:
@@ -273,6 +281,7 @@ def extract_renal_unit(
         unit |= renal_components == best_id
 
     contralateral_voxels = 0
+    contralateral_centroids: list[tuple[int, np.ndarray]] = []
     for component_id in range(1, renal_count + 1):
         component = renal_components == component_id
         if np.any(component & unit):
@@ -280,6 +289,9 @@ def extract_renal_unit(
         kidney_voxels = int(np.count_nonzero(component & kidney_first))
         if kidney_voxels * voxel_ml >= MIN_CONTRALATERAL_ML:
             contralateral_voxels += kidney_voxels
+            contralateral_centroids.append(
+                (kidney_voxels, np.array(ndi.center_of_mass(component & kidney_first)))
+            )
 
     # Working crop: renal unit plus a physical margin, clipped to the volume.
     unit_bounds = _bounds(unit)
@@ -324,14 +336,17 @@ def extract_renal_unit(
     kidney_work = (labels == int(CanonicalLabel.KIDNEY)) & unit_work
     if not kidney_work.any():
         raise PlanningError("No kidney parenchyma was found for this tumour.")
-    # Same convention as analysis.py: canonical RAS+, compared with the volume centre.
+    # Laterality from anatomy (opposite kidney, else aorta/IVC), never the image centre.
     kidney_world = work_affine[:3, :3] @ np.array(ndi.center_of_mass(kidney_work)) + work_affine[
         :3, 3
     ]
-    volume_center = np.asarray(affine, dtype=float) @ np.append(
-        (np.asarray(segmentation.shape) - 1) / 2.0, 1.0
-    )
-    side = "Right" if kidney_world[0] >= volume_center[0] else "Left"
+    if contralateral_centroids:
+        _voxels, other_voxel = max(contralateral_centroids, key=lambda item: item[0])
+        other_world = np.asarray(affine, dtype=float) @ np.append(other_voxel + first_offset, 1.0)
+        side = side_of(float(kidney_world[0]), 0.5 * (kidney_world[0] + other_world[0]), 0.0)
+    else:
+        midline = great_vessel_midline_x(segmentation, affine)
+        side = side_of(float(kidney_world[0]), midline) if midline is not None else UNKNOWN
 
     renal_unit = RenalUnit(
         tumor_index=tumor_index,
@@ -368,9 +383,10 @@ def _derive_geometry(unit: RenalUnit) -> None:
     candidate = unit.envelope & ~unit.tumor & ~unit.other_tumor & ~unit.cyst & ~vessels
     candidate &= depth > SINUS_MIN_DEPTH_MM
     if unit.image is not None:
-        low, high = SINUS_FAT_URINE_HU
-        candidate &= (~unit.kidney) | (unit.image < low) | (unit.image > high)
-        source = "Image-derived proxy (non-parenchymal fat/urine inside the renal envelope)"
+        # Inside the kidney label only fat counts: in corticomedullary scans the unenhanced
+        # medulla (and urine) share 0-50 HU and were misread as sinus (review finding).
+        candidate &= (~unit.kidney) | (unit.image < SINUS_FAT_HU)
+        source = "Image-derived proxy (non-parenchymal space and fat inside the renal envelope)"
     else:
         candidate &= ~unit.kidney
         source = "Label-derived proxy (non-parenchymal space inside the renal envelope)"
@@ -509,21 +525,35 @@ def nephrometry(unit: RenalUnit, distances: dict[str, Any]) -> dict[str, Any]:
     else:
         e_points = 3
 
-    # --- N
+    # --- N: nearest of collecting system (label) and renal sinus (only ever a proxy).
     collecting = distances.get("Collecting system")
     sinus = distances.get("Renal sinus")
-    nearness = collecting or sinus
-    if nearness is None:
-        n_points = None
-        notes.append("N not assessable: no collecting system label or sinus proxy.")
-    else:
-        gap = nearness["gap_mm"]
-        n_points = 1 if gap >= 7.0 else 2 if gap > 4.0 else 3
-        if collecting is None:
-            notes.append(
-                "N measured to an image-derived renal sinus proxy; add an excretory-phase "
-                "collecting system outline for a true N."
-            )
+    surfaces = [
+        (name, item)
+        for name, item in (("Collecting system", collecting), ("Renal sinus (proxy)", sinus))
+        if item is not None
+    ]
+    n_points: int | None = None
+    n_estimate: int | None = None
+    n_source: str | None = None
+    n_gap: float | None = None
+    n_low, n_high = 1, 3
+    if surfaces:
+        n_source, nearest_surface = min(surfaces, key=lambda entry: entry[1]["gap_mm"])
+        n_gap = float(nearest_surface["gap_mm"])
+        n_estimate = nearness_points(n_gap)
+    if collecting is not None:
+        # The true sinus can only be nearer than the collecting system, never farther
+        # than a measured label: N lies between N(collecting system) and 3.
+        n_low = nearness_points(collecting["gap_mm"])
+    if n_low == n_high:
+        n_points = n_low
+    if n_points is None:
+        notes.append(
+            "N is a range: the renal sinus has no reviewed outline. The estimate "
+            f"({n_estimate if n_estimate is not None else '—'}, from {n_source or 'nothing'}) "
+            "uses an image-derived proxy; check it on the images."
+        )
 
     # --- A
     anterior = _projections(unit, unit.tumor, "short")
@@ -573,16 +603,21 @@ def nephrometry(unit: RenalUnit, distances: dict[str, Any]) -> dict[str, Any]:
     else:
         notes.append("Hilar (h) suffix not assessable without renal artery/vein labels.")
 
-    renal_known = [r_points, e_points, n_points, l_points]
-    if n_points is None:
-        renal_total_min = r_points + e_points + 1 + l_points
-        renal_total_max = r_points + e_points + 3 + l_points
+    base_points = r_points + e_points + l_points
+    renal_total_min = base_points + (n_points if n_points is not None else n_low)
+    renal_total_max = base_points + (n_points if n_points is not None else n_high)
+    renal_total_estimate = (
+        base_points + (n_points if n_points is not None else n_estimate)
+        if (n_points is not None or n_estimate is not None)
+        else None
+    )
+    suffix = a_letter + ("h" if hilar else "")
+    if renal_total_min == renal_total_max:
+        renal_string = f"{renal_total_min}{suffix}"
     else:
-        renal_total_min = renal_total_max = sum(renal_known)
-    renal_string = (
-        f"{renal_total_min}" if renal_total_min == renal_total_max
-        else f"{renal_total_min}–{renal_total_max}"
-    ) + a_letter + ("h" if hilar else "")
+        renal_string = f"{renal_total_min}–{renal_total_max}{suffix}"
+        if renal_total_estimate is not None:
+            renal_string += f" (est. {renal_total_estimate})"
 
     # --- PADUA
     middle = _projections(unit, unit.tumor, "middle")
@@ -593,9 +628,8 @@ def nephrometry(unit: RenalUnit, distances: dict[str, Any]) -> dict[str, Any]:
         "Renal rim": (
             None if medial_fraction is None else (2 if medial_fraction > 0.5 else 1)
         ),
-        "Renal sinus": (
-            None if sinus is None else (2 if sinus["gap_mm"] <= CONTACT_TOLERANCE_MM else 1)
-        ),
+        # Sinus involvement needs a reviewed sinus outline; the proxy is only an estimate.
+        "Renal sinus": None,
         "Urinary collecting system": (
             None
             if collecting is None
@@ -610,6 +644,9 @@ def nephrometry(unit: RenalUnit, distances: dict[str, Any]) -> dict[str, Any]:
     padua_max = known_padua + 2 * unknown_padua
     if padua_items["Urinary collecting system"] is None:
         notes.append("PADUA collecting-system item needs a collecting system outline.")
+    padua_sinus_estimate = (
+        None if sinus is None else (2 if sinus["gap_mm"] <= CONTACT_TOLERANCE_MM else 1)
+    )
 
     return {
         "max_diameter_mm": diameter,
@@ -623,6 +660,11 @@ def nephrometry(unit: RenalUnit, distances: dict[str, Any]) -> dict[str, Any]:
             "R": r_points,
             "E": e_points,
             "N": n_points,
+            "N_range": [n_points, n_points] if n_points is not None else [n_low, n_high],
+            "N_estimate": n_points if n_points is not None else n_estimate,
+            "N_source": n_source,
+            "N_gap_mm": n_gap,
+            "total_estimate": renal_total_estimate,
             "A": a_letter,
             "L": l_points,
             "hilar": hilar,
@@ -633,6 +675,7 @@ def nephrometry(unit: RenalUnit, distances: dict[str, Any]) -> dict[str, Any]:
         },
         "padua": {
             "items": padua_items,
+            "renal_sinus_estimate": padua_sinus_estimate,
             "face": a_letter,
             "total_min": padua_min,
             "total_max": padua_max,
@@ -783,11 +826,17 @@ def arterial_territories(unit: RenalUnit, depth: int = 1) -> dict[str, Any] | No
     component_rank = 0
 
     components = sorted(nx.connected_components(graph), key=len, reverse=True)
+    fragments = 0
     for component in components:
         nodes = np.fromiter(component, dtype=np.int64)
         if not reaches[nodes].any():
             continue
         root = int(nodes[np.argmax(node_renal_distance[nodes])])
+        if node_renal_distance[root] < ROOT_MIN_EXTRARENAL_MM:
+            # Starts inside/at the kidney: a disconnected piece of the tree (segmentation
+            # gap), not an accessory artery. Never give it a territory of its own.
+            fragments += 1
+            continue
         predecessors, distance = nx.dijkstra_predecessor_and_distance(graph.subgraph(nodes), root)
         parent = {node: (pred[0] if pred else None) for node, pred in predecessors.items()}
         children: dict[int, list[int]] = {node: [] for node in parent}
@@ -805,10 +854,15 @@ def arterial_territories(unit: RenalUnit, depth: int = 1) -> dict[str, Any] | No
             subtree_length[node_parent] += subtree_length[node] + edge
             subtree_reaches[node_parent] |= subtree_reaches[node]
 
-        def significant(child: int, node: int) -> bool:
+        def significant(
+            child: int,
+            node: int,
+            lengths: dict[int, float] = subtree_length,
+            reach: dict[int, bool] = subtree_reaches,
+        ) -> bool:
             return (
-                subtree_reaches[child]
-                and subtree_length[child] + graph[node][child]["weight"] >= BRANCH_MIN_LENGTH_MM
+                reach[child]
+                and lengths[child] + graph[node][child]["weight"] >= BRANCH_MIN_LENGTH_MM
             )
 
         accessory = component_rank > 0
@@ -900,9 +954,22 @@ def arterial_territories(unit: RenalUnit, depth: int = 1) -> dict[str, Any] | No
     artery_count = sum(
         1 for info in lineage_info.values() if info["order"] == 0
     )
+    warnings = []
+    if fragments:
+        warnings.append(
+            f"{fragments} disconnected artery fragment(s) inside the kidney were ignored; "
+            "the vessel segmentation has gaps, so nearby territories are unreliable."
+        )
+    if len(branches) < 2:
+        warnings.append("Fewer than two branches resolved: no selective-clamping estimate.")
+    reliable = not warnings
     return {
         "depth": depth,
         "renal_artery_count": artery_count,
+        "ignored_fragments": fragments,
+        "warnings": warnings,
+        # Ischaemic volumes are only shown when the tree looks complete.
+        "ischemia_estimate_reliable": reliable,
         "branches": branches,
         "feeding_branches": [branch["name"] for branch in feeding],
         "main_clamp_ischemic_ml": parenchyma_total,

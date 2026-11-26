@@ -74,7 +74,9 @@ This is usually the easier conversation with a data-protection officer.
 ## 3. Daily workflow
 
 1. **Patient cases → Upload ZIP** (≤ 100 MB through Cloudflare) **or Import from inbox**.
-   Give only a short label: never a name, date of birth or hospital number.
+   Give only a short label: never a name, date of birth or hospital number. An inbox study
+   is deleted only after its DICOM → NIfTI conversion has succeeded; if the import or
+   conversion fails, it stays in the inbox.
 2. Check the series table. Each phase is guessed from the series description (English and
    German keywords: *arteriell, portalvenös, Spätphase, nativ …*). Correct it if needed.
    The nephrographic/portal-venous series becomes the planning grid.
@@ -97,8 +99,10 @@ This is usually the easier conversation with a data-protection officer.
 
 ## 4. Data protection built in
 
-- Raw DICOM is deleted right after conversion (also when it fails). NIfTI files contain no
-  DICOM header fields.
+- Raw DICOM is deleted right after conversion (also when it fails, and when a worker dies).
+  NIfTI files contain no DICOM header fields. Series descriptions and UIDs, which can hold
+  free text, are kept only beside the raw upload and deleted with it; saved requests use
+  opaque handles (S1, S2 …).
 - Cases get random IDs (`PN-xxxxxxxx`) and are deleted automatically after
   `RENAL_RETENTION_DAYS` (default 30). Cases can be deleted manually at any time.
 - Case folders are only readable by your macOS user (`chmod 700`).
@@ -116,7 +120,7 @@ but body habitus can be distinctive).
 | Component | Licence | Notes |
 |---|---|---|
 | TotalSegmentator code + open-task weights | Apache-2.0 | Not intended for clinical use (authors) |
-| totalsegmentator-mlx | Apache-2.0 code; upstream weights | Research and education |
+| totalsegmentator-mlx (pinned 0.1.x) | Apache-2.0 code; upstream weights | Research and education. 0.4 removed the API used here; the pipeline falls back to PyTorch |
 | AbdomenAtlasNet-Tumors | **CC BY-NC 4.0** | Non-commercial research only |
 | KiPA22-trained vessel model | KiPA22 terms (CC BY-NC-ND) | Train it yourself; see `training/README.md` |
 

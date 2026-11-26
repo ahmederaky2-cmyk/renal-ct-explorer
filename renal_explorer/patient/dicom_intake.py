@@ -5,15 +5,20 @@ SimpleITK is imported lazily so the public demo (which never sees DICOM) does no
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
 import zipfile
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 MAX_UNCOMPRESSED_BYTES = 6 * 1024**3
 MAX_FILES = 20_000
 MIN_SLICES = 20
+# Kept inside raw/ only, so they are deleted together with the DICOM upload.
+PRIVATE_INDEX = ".series_index.json"
+SOURCE_RECORD = ".source.json"
 
 PHASES = ("nephrographic", "arterial", "excretory", "non-contrast", "other")
 MAIN_PHASE_PREFERENCE = ("nephrographic", "arterial", "excretory", "non-contrast", "other")
@@ -47,12 +52,65 @@ class SeriesInfo:
     phase_guess: str
     files: list[str]
 
-    def public(self) -> dict[str, Any]:
-        """Display/storage view without file paths."""
 
-        data = asdict(self)
-        data.pop("files")
-        return data
+def write_series_index(raw_dir: Path, series: list[SeriesInfo]) -> list[dict[str, Any]]:
+    """Store UIDs and descriptions privately (in raw/); return opaque public records.
+
+    Series descriptions can contain free text and UIDs are linkable identifiers, so neither
+    is ever written outside raw/, which is deleted after conversion.
+    """
+
+    index: dict[str, dict[str, str]] = {}
+    public: list[dict[str, Any]] = []
+    for number, item in enumerate(series, start=1):
+        handle = f"S{number}"
+        index[handle] = {"series_uid": item.series_uid, "description": item.description}
+        public.append(
+            {
+                "handle": handle,
+                "slices": item.slices,
+                "slice_thickness_mm": item.slice_thickness_mm,
+                "phase_guess": item.phase_guess,
+            }
+        )
+    (raw_dir / PRIVATE_INDEX).write_text(json.dumps(index))
+    return public
+
+
+def read_series_index(raw_dir: Path) -> dict[str, dict[str, str]]:
+    try:
+        return json.loads((raw_dir / PRIVATE_INDEX).read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def record_inbox_source(raw_dir: Path, source: Path) -> None:
+    (raw_dir / SOURCE_RECORD).write_text(json.dumps({"path": str(source)}))
+
+
+def consume_inbox_source(raw_dir: Path, inbox_root: Path) -> bool:
+    """Delete the original inbox study once its conversion has succeeded.
+
+    Only a direct child of the inbox folder is ever deleted.
+    """
+
+    try:
+        record = json.loads((raw_dir / SOURCE_RECORD).read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    source = Path(record.get("path", ""))
+    try:
+        if source.resolve().parent != inbox_root.resolve() or source.is_symlink():
+            return False
+    except OSError:
+        return False
+    if source.is_dir():
+        shutil.rmtree(source)
+    elif source.is_file():
+        source.unlink()
+    else:
+        return False
+    return True
 
 
 def _fold(text: str) -> str:

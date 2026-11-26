@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 import traceback
 from pathlib import Path
@@ -10,7 +11,13 @@ from typing import Any
 import numpy as np
 
 from ..labels import CanonicalLabel
-from .dicom_intake import convert_series, list_series, main_phase
+from .dicom_intake import (
+    consume_inbox_source,
+    convert_series,
+    list_series,
+    main_phase,
+    read_series_index,
+)
 from .fusion import fuse
 from .registration import register_phase
 from .segmenters import (
@@ -140,8 +147,10 @@ def run_case(case: PatientCase, settings: PipelineSettings | None = None) -> dic
     case.phases_dir.mkdir(exist_ok=True)
     native_paths: dict[str, Path] = {}
     try:
+        index = read_series_index(case.raw_dir)
         series = {item.series_uid: item for item in list_series(case.raw_dir)}
-        for phase, uid in assignment.items():
+        for phase, handle in assignment.items():
+            uid = index.get(handle, {}).get("series_uid", handle)
             if uid not in series:
                 raise PipelineError(f"Series for {phase} phase not found in the upload.")
             target = (
@@ -151,9 +160,11 @@ def run_case(case: PatientCase, settings: PipelineSettings | None = None) -> dic
             native_paths[phase] = target
             provenance["phases"][phase] = {
                 **info,
-                "description": series[uid].description,
                 "slice_thickness_mm": series[uid].slice_thickness_mm,
             }
+        inbox = Path(os.environ.get("RENAL_INBOX", "~/RenalPlanner/inbox")).expanduser()
+        if consume_inbox_source(case.raw_dir, inbox):
+            log("Inbox study deleted after successful conversion.")
     finally:
         case.discard_raw()
         log("Raw DICOM upload deleted.")

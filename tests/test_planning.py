@@ -110,7 +110,8 @@ def test_exophytic_upper_pole_tumor_scores() -> None:
     assert 22.0 <= summary["scores"]["max_diameter_mm"] <= 28.0
     assert renal["R"] == 1
     assert renal["E"] == 1
-    assert renal["N"] == 1
+    assert renal["N"] is None and renal["N_range"] == [1, 3]  # no reviewed sinus outline
+    assert renal["N_estimate"] == 1 and renal["N_source"] == "Renal sinus (proxy)"
     assert renal["A"] == "x"
     assert renal["L"] in (1, 2)
     assert summary["scores"]["location"] == "Upper pole"
@@ -133,10 +134,10 @@ def test_central_endophytic_tumor_is_high_complexity() -> None:
     plan = build_plan(segmentation, affine, SPACING, image, margin_mm=0.0)
     renal = plan["summary"]["scores"]["renal"]
     assert renal["E"] == 3
-    assert renal["N"] == 3
+    assert renal["N_estimate"] == 3
     assert renal["L"] == 3
-    assert renal["total_min"] >= 10
-    assert renal["complexity"] == "High"
+    assert renal["total_estimate"] >= 10
+    assert renal["total_max"] >= 10 and "est." in renal["score"]
     assert plan["summary"]["resection"]["removed_parenchyma_ml"] == 0.0
     assert plan["summary"]["scores"]["padua"]["total_max"] > plan["summary"]["scores"][
         "padua"
@@ -188,13 +189,13 @@ def test_hilar_suffix_only_for_main_vessel_contact() -> None:
     segmentation, image, affine = phantom(hilar_center, 6.0, with_artery=True)
     renal = build_plan(segmentation, affine, SPACING, image)["summary"]["scores"]["renal"]
     assert renal["hilar"] is True
-    assert renal["score"].endswith("h")
+    assert renal["score"].split(" ")[0].endswith("h")
 
     lateral_center = (CENTER_MM[0] - 23.0, CENTER_MM[1], CENTER_MM[2] + 32.0)
     segmentation, image, affine = phantom(lateral_center, 12.0, with_artery=True)
     renal = build_plan(segmentation, affine, SPACING, image)["summary"]["scores"]["renal"]
     assert renal["hilar"] is False
-    assert renal["N"] == 1
+    assert renal["N_estimate"] == 1
 
 
 def test_exports_stl_zip_and_pdf() -> None:
@@ -242,3 +243,114 @@ def test_assemble_does_not_mutate_cached_geometry() -> None:
     center = tumor_center_voxel(first)
     expected = np.rint(np.asarray(tumor_center) / np.asarray(SPACING))
     assert np.all(np.abs(np.asarray(center) - expected) <= 1)
+
+
+def test_side_survives_cropping_and_uses_anatomy() -> None:
+    """Regression (review): cropping must not flip a left kidney to 'Right'."""
+
+    from renal_explorer.analysis import analyze_case
+    from renal_explorer.models import VolumeCase
+
+    tumor_center = (CENTER_MM[0] - 23.0, CENTER_MM[1], CENTER_MM[2] + 32.0)
+    segmentation, image, affine = phantom(tumor_center, 12.0)
+    assert build_plan(segmentation, affine, SPACING, image)["summary"]["side"] == "Left"
+
+    # Crop away the low-x half: the left kidney now sits right of the image centre.
+    cropped = segmentation[12:, :, :]
+    cropped_affine = affine.copy()
+    cropped_affine[0, 3] = 12 * SPACING[0]
+    plan = build_plan(cropped, cropped_affine, SPACING, image[12:])
+    assert plan["summary"]["side"] == "Left"
+
+    # Only one kidney and no great vessels: refuse to guess.
+    single = segmentation.copy()
+    single[100:, :, :] = 0  # remove the contralateral kidney
+    assert build_plan(single, affine, SPACING, image)["summary"]["side"] == "Unknown"
+
+    # One kidney plus an aorta at the midline: the aorta decides.
+    single[78:84, 66:72, 20:70] = int(CanonicalLabel.AORTA)
+    assert build_plan(single, affine, SPACING, image)["summary"]["side"] == "Left"
+
+    case = VolumeCase("t", "c", image[12:], cropped, SPACING, cropped_affine)
+    analysis = analyze_case(case)
+    assert {kidney["laterality"] for kidney in analysis["kidney_components"]} == {"Left", "Right"}
+    assert analysis["tumor_components"][0]["laterality"] == "Left"
+
+
+def test_n_uses_nearest_surface_and_ranges_without_reviewed_sinus() -> None:
+    """Regression (review): collecting system 9 mm + sinus 2 mm must not give N1."""
+
+    from renal_explorer.planning import extract_renal_unit, nephrometry
+
+    tumor_center = (CENTER_MM[0] - 14.0, CENTER_MM[1], CENTER_MM[2])
+    segmentation, image, affine = phantom(tumor_center, 7.0)
+    unit = extract_renal_unit(segmentation, affine, SPACING, image)
+
+    renal = nephrometry(
+        unit, {"Collecting system": {"gap_mm": 9.0}, "Renal sinus": {"gap_mm": 2.0}}
+    )["renal"]
+    assert renal["N"] is None
+    assert renal["N_range"] == [1, 3]
+    assert renal["N_estimate"] == 3 and renal["N_source"] == "Renal sinus (proxy)"
+
+    renal = nephrometry(
+        unit, {"Collecting system": {"gap_mm": 2.0}, "Renal sinus": {"gap_mm": 6.0}}
+    )["renal"]
+    assert renal["N"] == 3 and renal["N_source"] == "Collecting system"
+
+    renal = nephrometry(unit, {"Collecting system": {"gap_mm": 5.0}})["renal"]
+    assert renal["N"] is None and renal["N_range"] == [2, 3]
+
+
+def test_sinus_proxy_ignores_low_density_parenchyma() -> None:
+    """Regression (review): unenhanced medulla inside the kidney label is not sinus."""
+
+    from renal_explorer.planning import extract_renal_unit
+
+    tumor_center = (CENTER_MM[0] - 23.0, CENTER_MM[1], CENTER_MM[2] + 32.0)
+    segmentation, image, affine = phantom(tumor_center, 12.0)
+    # Mimic a corticomedullary phase: a dark (30 HU) medulla band inside the kidney label.
+    medulla = _ellipsoid(CENTER_MM - [8.0, 0.0, 0.0], (8.0, 10.0, 35.0))
+    medulla &= segmentation == int(CanonicalLabel.KIDNEY)
+    image[medulla] = 30.0
+    unit = extract_renal_unit(segmentation, affine, SPACING, image)
+    assert unit.sinus is not None
+    assert not np.any(unit.sinus & unit.kidney & (unit.image > -30))
+
+
+def test_intrarenal_fragment_is_not_an_accessory_artery() -> None:
+    """Regression (review): a disconnected intrarenal fragment got its own 24 % territory."""
+
+    tumor_center = (CENTER_MM[0] - 23.0, CENTER_MM[1], CENTER_MM[2] + 32.0)
+    segmentation, image, affine = phantom(tumor_center, 12.0, with_artery=True)
+    fragment = _tube(
+        (CENTER_MM[0] - 14.0, CENTER_MM[1] + 12.0, CENTER_MM[2] - 12.0),
+        (CENTER_MM[0] - 16.0, CENTER_MM[1] + 12.0, CENTER_MM[2] - 34.0),
+        1.5,
+    )
+    segmentation[fragment & (segmentation == int(CanonicalLabel.KIDNEY))] = int(
+        CanonicalLabel.RENAL_ARTERY
+    )
+    territories = build_plan(segmentation, affine, SPACING, image)["summary"]["territories"]
+    assert territories["ignored_fragments"] == 1
+    assert territories["renal_artery_count"] == 1
+    assert not any(branch["accessory"] for branch in territories["branches"])
+    assert len(territories["branches"]) == 2
+    assert territories["ischemia_estimate_reliable"] is False
+    assert territories["warnings"]
+
+
+def test_imported_vessels_may_replace_kidney_but_not_tumour() -> None:
+    from types import SimpleNamespace
+
+    from renal_explorer.plan_ui import planning_segmentation
+
+    labels = np.zeros((4, 4, 4), np.uint8)
+    labels[0] = int(CanonicalLabel.KIDNEY)
+    labels[1] = int(CanonicalLabel.TUMOR)
+    prediction = np.full((4, 4, 4), int(CanonicalLabel.RENAL_ARTERY), np.uint8)
+    case = SimpleNamespace(segmentation=labels)
+    merged = planning_segmentation(case, SimpleNamespace(segmentation=prediction))
+    assert (merged[0] == int(CanonicalLabel.RENAL_ARTERY)).all()  # was discarded before
+    assert (merged[1] == int(CanonicalLabel.TUMOR)).all()
+    assert (merged[2] == int(CanonicalLabel.RENAL_ARTERY)).all()

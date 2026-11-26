@@ -126,21 +126,22 @@ def plan_row(summary: dict[str, Any], prefix: str) -> dict[str, Any]:
     scores = summary["scores"]
     renal = scores["renal"]
     padua = scores["padua"]
-    nearness = summary["distances"].get("Collecting system") or summary["distances"].get(
-        "Renal sinus"
-    )
     return {
         f"{prefix}_R": renal["R"],
         f"{prefix}_E": renal["E"],
-        f"{prefix}_N": renal["N"],
+        # N is usually an estimate (no reviewed sinus outline); the flag says which.
+        f"{prefix}_N": renal["N"] if renal["N"] is not None else renal.get("N_estimate"),
+        f"{prefix}_N_definitive": renal["N"] is not None,
+        f"{prefix}_N_source": renal.get("N_source"),
         f"{prefix}_A": renal["A"],
         f"{prefix}_L": renal["L"],
         f"{prefix}_h": renal["hilar"],
-        f"{prefix}_renal_total": renal["total_min"] if renal["N"] is not None else None,
+        f"{prefix}_renal_total": renal.get("total_estimate"),
+        f"{prefix}_renal_total_range": f"{renal['total_min']}-{renal['total_max']}",
         f"{prefix}_padua_min": padua["total_min"],
         f"{prefix}_diameter_mm": scores["max_diameter_mm"],
         f"{prefix}_exophytic_pct": 100.0 * scores["exophytic_fraction"],
-        f"{prefix}_nearness_mm": nearness["gap_mm"] if nearness else None,
+        f"{prefix}_nearness_mm": renal.get("N_gap_mm"),
         f"{prefix}_parenchyma_kept_pct": summary["resection"]["preserved_ipsilateral_pct"],
     }
 

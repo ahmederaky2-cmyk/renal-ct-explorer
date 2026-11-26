@@ -71,7 +71,11 @@ def read_manual(path: Path) -> dict[str, dict[str, Any]]:
 
 def read_planner(path: Path) -> dict[str, dict[str, Any]]:
     with open(path, newline="") as handle:
-        return {row["case"]: row for row in csv.DictReader(handle) if not row.get("error")}
+        return {
+            row["case"]: row
+            for row in csv.DictReader(handle)
+            if row.get("status", "ok" if not row.get("error") else "failed") == "ok"
+        }
 
 
 def compare(manual: dict[str, dict[str, Any]], planner: dict[str, dict[str, Any]], prefix: str):

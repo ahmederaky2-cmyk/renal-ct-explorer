@@ -63,7 +63,12 @@ def reconcile(store: PatientStore, grace_seconds: float = 60.0) -> None:
         if process_alive(pid):
             continue
         if pid or time.time() - status.get("updated", 0) > grace_seconds:
+            case.discard_raw()
             case.update_status(state="failed", error="Worker stopped unexpectedly; run again.")
+    # Orphaned raw uploads (crash between steps) never outlive a finished case.
+    for case in store.cases():
+        if case.status().get("state") in ("done", "failed") and case.raw_dir.exists():
+            case.discard_raw()
 
 
 def main(argv: list[str]) -> int:

@@ -147,8 +147,11 @@ def evaluate_case(args: argparse.Namespace, case_id: str) -> dict[str, Any]:
         warnings = provenance["warnings"]
     prediction = load_canonical_labels(prediction_path, case.image.shape)
 
+    if not prediction_path.is_file():
+        raise RuntimeError("Segmentation produced no prediction file.")
     row: dict[str, Any] = {
         "case": case_id,
+        "status": "ok",
         "dataset": args.dataset,
         "seen_by_tumor_model": args.dataset in SEEN_BY_TUMOR_MODEL,
         "slice_mm": round(case.spacing[2], 2),
@@ -181,7 +184,9 @@ def read_results(path: Path) -> list[dict[str, Any]]:
 
 
 def append_result(path: Path, row: dict[str, Any]) -> None:
-    rows = read_results(path) + [row]
+    """Add a row, replacing an earlier attempt at the same case (failed cases are retried)."""
+
+    rows = [item for item in read_results(path) if item.get("case") != row.get("case")] + [row]
     fields: list[str] = []
     for item in rows:
         fields.extend(key for key in item if key not in fields)
@@ -206,8 +211,12 @@ def _ordinal(value: Any) -> Any:
     return value if value not in ("", None, "None") else None
 
 
+def succeeded(row: dict[str, Any]) -> bool:
+    return row.get("status") == "ok"
+
+
 def summarise(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    ok = [row for row in rows if not row.get("error")]
+    ok = [row for row in rows if succeeded(row)]
 
     def stats(key: str) -> dict[str, Any]:
         values = [value for value in (_number(row.get(key)) for row in ok) if value is not None]
@@ -249,7 +258,14 @@ def summarise(rows: list[dict[str, Any]]) -> dict[str, Any]:
         )
     return {
         "cases": len(rows),
+        "succeeded": len(ok),
         "failed": len(rows) - len(ok),
+        "failed_cases": [row.get("case") for row in rows if not succeeded(row)],
+        "n_definitive_fraction": (
+            float(np.mean([str(row.get("auto_N_definitive")) == "True" for row in ok]))
+            if ok
+            else None
+        ),
         "seen_by_tumor_model": any(str(row.get("seen_by_tumor_model")) == "True" for row in ok),
         "renal_mass_dice": stats("renal_mass_dice"),
         "tumor_dice": stats("tumor_dice"),
@@ -278,9 +294,16 @@ def write_report(out: Path, summary: dict[str, Any]) -> Path:
     lines = [
         "# Validation report",
         "",
-        f"Cases: {summary['cases']} (failed: {summary['failed']})",
+        f"Cases: {summary['cases']} (succeeded: {summary['succeeded']}, "
+        f"failed: {summary['failed']})",
         "",
     ]
+    if summary["failed"]:
+        lines += [
+            f"> **{summary['failed']} case(s) failed** and are excluded from every metric: "
+            f"{', '.join(summary['failed_cases'])}. See the `error` column; rerun to retry.",
+            "",
+        ]
     if summary["seen_by_tumor_model"]:
         lines += [
             "> **Optimistic:** these cases come from a dataset AbdomenAtlasNet was trained on. "
@@ -324,6 +347,8 @@ def write_report(out: Path, summary: dict[str, Any]) -> Path:
     lines += [
         "",
         "Exact agreement on continuous items (mm, %) is not meaningful; read the differences.",
+        "N (and therefore the total) is an estimate unless a collecting-system label exists: "
+        f"definitive in {_fmt(summary['n_definitive_fraction'])} of cases.",
         "Research software — not a clinical validation.",
     ]
     path = out / "report.md"
@@ -338,7 +363,7 @@ def main() -> int:
     results = args.out / "results.csv"
 
     if not args.report_only:
-        done = {row["case"] for row in read_results(results)}
+        done = {row["case"] for row in read_results(results) if succeeded(row)}
         started = time.monotonic()
         durations: list[float] = []
         for case_id in case_list(args):
@@ -354,8 +379,14 @@ def main() -> int:
             try:
                 row = evaluate_case(args, case_id)
             except Exception as exc:  # noqa: BLE001 - keep going, record the failure
-                row = {"case": case_id, "dataset": args.dataset, "error": str(exc)[:300]}
-                print(f"    failed: {exc}", flush=True)
+                message = f"{type(exc).__name__}: {exc}".strip()[:300]
+                row = {
+                    "case": case_id,
+                    "status": "failed",
+                    "dataset": args.dataset,
+                    "error": message,
+                }
+                print(f"    failed: {message}", flush=True)
             append_result(results, row)
             durations.append(time.monotonic() - case_start)
 
@@ -363,7 +394,7 @@ def main() -> int:
     (args.out / "summary.json").write_text(json.dumps(summary, indent=2))
     report = write_report(args.out, summary)
     print(report.read_text())
-    return 0
+    return 1 if summary["failed"] else 0
 
 
 if __name__ == "__main__":

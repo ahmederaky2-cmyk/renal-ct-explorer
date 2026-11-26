@@ -317,14 +317,20 @@ def run_atlasnet_tumors(
     )
     work_dir.mkdir(parents=True, exist_ok=True)
     output_base = work_dir / "atlasnet_tumors"
-    predictor.predict_from_files(
-        [[str(ct_path)]],
-        [str(output_base)],
-        save_probabilities=False,
-        overwrite=True,
-        num_processes_preprocessing=1,
-        num_processes_segmentation_export=1,
-    )
+    if hasattr(predictor, "predict_from_files_sequential"):
+        # Single process: avoids multiprocessing failures (sockets, macOS spawn, notebooks).
+        predictor.predict_from_files_sequential(
+            [[str(ct_path)]], [str(output_base)], save_probabilities=False, overwrite=True
+        )
+    else:
+        predictor.predict_from_files(
+            [[str(ct_path)]],
+            [str(output_base)],
+            save_probabilities=False,
+            overwrite=True,
+            num_processes_preprocessing=1,
+            num_processes_segmentation_export=1,
+        )
     output = next(work_dir.glob("atlasnet_tumors.nii*"), None)
     if output is None:
         raise SegmentationError("nnU-Net produced no output file.")

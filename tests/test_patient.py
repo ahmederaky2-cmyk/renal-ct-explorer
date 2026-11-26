@@ -10,12 +10,17 @@ import pytest
 
 from renal_explorer.labels import CanonicalLabel
 from renal_explorer.patient.dicom_intake import (
+    PRIVATE_INDEX,
     DicomIntakeError,
     SeriesInfo,
+    consume_inbox_source,
     default_assignment,
     guess_phase,
     main_phase,
+    read_series_index,
+    record_inbox_source,
     safe_extract_zip,
+    write_series_index,
 )
 from renal_explorer.patient.fusion import fuse
 from renal_explorer.patient.segmenters import (
@@ -102,8 +107,11 @@ def test_store_lifecycle_and_retention(tmp_path: Path) -> None:
     reconcile(store)
     assert case.status()["state"] == "queued"  # just launched: grace period, no PID yet
     case.update_status(state="running", pid=999_999_999)
+    case.raw_dir.mkdir()
+    (case.raw_dir / "IM0001").write_bytes(b"dicom")
     reconcile(store)
     assert case.status()["state"] == "failed"
+    assert not case.raw_dir.exists()  # regression (review): dead worker kept raw input
 
     case.update_status(created=0)
     assert store.purge_expired(retention_days=1) == [case.case_id]
@@ -227,6 +235,12 @@ def test_pipeline_end_to_end_with_fake_models(tmp_path: Path, monkeypatch) -> No
     case.write_request(
         {"assignment": {"nephrographic": "n", "excretory": "e"}, "main_phase": "nephrographic"}
     )
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    study = inbox / "study"
+    study.mkdir()
+    record_inbox_source(case.raw_dir, study)
+    monkeypatch.setenv("RENAL_INBOX", str(inbox))
 
     volumes = {"n": ct, "e": excretory}
     monkeypatch.setattr(
@@ -261,6 +275,7 @@ def test_pipeline_end_to_end_with_fake_models(tmp_path: Path, monkeypatch) -> No
     pipeline.run_and_record(case)
     status = case.status()
     assert status["state"] == "done", status
+    assert not study.exists()  # consumed only after a successful conversion
     assert not case.raw_dir.exists()
     labels = np.asanyarray(nib.load(str(case.segmentation_path)).dataobj)
     assert (labels[tumor] == int(CanonicalLabel.TUMOR)).all()
@@ -269,3 +284,71 @@ def test_pipeline_end_to_end_with_fake_models(tmp_path: Path, monkeypatch) -> No
     assert provenance["collecting_system"]["voxels"] > 0
     assert any("arterial" in warning.lower() for warning in provenance["warnings"])
     assert store.ready_cases() == [case]
+
+
+def test_series_identifiers_stay_in_raw_only(tmp_path: Path) -> None:
+    """Regression (review): descriptions/UIDs must not be persisted outside raw/."""
+
+    store = PatientStore(tmp_path / "store")
+    case = store.create_case()
+    case.raw_dir.mkdir()
+    marker = "MUSTERMANN^MAX arteriell"
+    series = [SeriesInfo("1.2.840.99.1", marker, 300, 1.0, "101010", "arterial", ["x"])]
+    public = write_series_index(case.raw_dir, series)
+    case.write_request({"series": public})
+    stored = (case.path / "request.json").read_text()
+    assert marker not in stored and "1.2.840" not in stored
+    assert public == [
+        {"handle": "S1", "slices": 300, "slice_thickness_mm": 1.0, "phase_guess": "arterial"}
+    ]
+    assert read_series_index(case.raw_dir)["S1"]["description"] == marker
+    assert (case.raw_dir / PRIVATE_INDEX).exists()
+    case.discard_raw()
+    assert not any(marker in path.read_text() for path in case.path.rglob("*") if path.is_file())
+
+
+def test_inbox_source_deleted_only_when_consumed_and_inside_inbox(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    study = inbox / "study.zip"
+    study.write_bytes(b"zip")
+    outside = tmp_path / "elsewhere.zip"
+    outside.write_bytes(b"zip")
+    raw = tmp_path / "raw"
+    raw.mkdir()
+
+    assert consume_inbox_source(raw, inbox) is False  # nothing recorded: nothing deleted
+    record_inbox_source(raw, outside)
+    assert consume_inbox_source(raw, inbox) is False and outside.exists()
+    record_inbox_source(raw, study)
+    assert consume_inbox_source(raw, inbox) is True and not study.exists()
+
+
+def test_failed_conversion_keeps_inbox_study(tmp_path: Path, monkeypatch) -> None:
+    """Regression (review): an import/conversion failure must not delete the original."""
+
+    from renal_explorer.patient import pipeline
+    from renal_explorer.patient.dicom_intake import SeriesInfo as Info
+
+    store = PatientStore(tmp_path / "store")
+    case = store.create_case()
+    case.raw_dir.mkdir()
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    study = inbox / "study.zip"
+    study.write_bytes(b"zip")
+    record_inbox_source(case.raw_dir, study)
+    case.write_request({"assignment": {"nephrographic": "n"}, "main_phase": "nephrographic"})
+    monkeypatch.setenv("RENAL_INBOX", str(inbox))
+    monkeypatch.setattr(
+        pipeline, "list_series", lambda folder: [Info("n", "", 60, 1.0, "", "", [])]
+    )
+
+    def broken(files, output_path):
+        raise RuntimeError("corrupt series")
+
+    monkeypatch.setattr(pipeline, "convert_series", broken)
+    pipeline.run_and_record(case)
+    assert case.status()["state"] == "failed"
+    assert study.exists()
+    assert not case.raw_dir.exists()
