@@ -1,0 +1,541 @@
+"""Streamlit "Surgical plan" tab. Research-only partial nephrectomy planning."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from .exports import plan_report_pdf, stl_zip
+from .labels import LABEL_COLORS, CanonicalLabel
+from .planning import PlanningError, assemble_plan, plan_geometry, tumor_center_voxel
+from .rendering import render_view
+from .three_d import surface_mesh
+
+BRANCH_DEPTHS = {
+    1: "Divisions (1st significant bifurcation)",
+    2: "Segmental (2nd significant bifurcation)",
+    3: "Sub-segmental (3rd)",
+}
+PLAN_STYLE = {
+    "Kidney": ((45, 200, 90), 0.30),
+    "Tumor": ((255, 65, 65), 0.95),
+    "Resection volume": ((255, 150, 40), 0.35),
+    "Renal sinus (proxy)": ((240, 220, 140), 0.25),
+    "Renal artery": (LABEL_COLORS[CanonicalLabel.RENAL_ARTERY], 0.95),
+    "Renal vein": (LABEL_COLORS[CanonicalLabel.RENAL_VEIN], 0.85),
+    "Collecting system": (LABEL_COLORS[CanonicalLabel.COLLECTING_SYSTEM], 0.85),
+}
+
+
+@st.cache_resource(show_spinner=False, max_entries=2)
+def cached_plan_geometry(
+    dataset_key: str,
+    case_id: str,
+    segmentation_token: str,
+    tumor_index: int,
+    branch_depth: int,
+    _segmentation: np.ndarray,
+    _affine: np.ndarray,
+    _spacing: tuple[float, float, float],
+    _image: np.ndarray,
+):
+    del dataset_key, case_id, segmentation_token
+    return plan_geometry(_segmentation, _affine, _spacing, _image, tumor_index, branch_depth)
+
+
+@st.cache_data(show_spinner=False, max_entries=24)
+def cached_plan_mesh(
+    plan_key: str,
+    structure: str,
+    quality: str,
+    _mask: np.ndarray,
+    _affine: np.ndarray,
+    _spacing: tuple[float, float, float],
+):
+    del plan_key, structure
+    if _mask is None or not np.any(_mask):
+        return None
+    return surface_mesh(_mask.astype(np.uint8), _affine, _spacing, 1, quality)
+
+
+def _json_default(value: Any):
+    if hasattr(value, "item"):
+        return value.item()
+    if isinstance(value, (set, tuple)):
+        return list(value)
+    return str(value)
+
+
+def planning_segmentation(case, imported_prediction) -> np.ndarray:
+    """Dataset labels, with imported vessel predictions filled into unlabeled voxels."""
+
+    if imported_prediction is None:
+        return case.segmentation
+    merged = case.segmentation.copy()
+    prediction = imported_prediction.segmentation
+    fill = (merged == 0) & (prediction > 0)
+    merged[fill] = prediction[fill]
+    return merged
+
+
+def _rgb(color) -> str:
+    red, green, blue = color
+    return f"rgb({red},{green},{blue})"
+
+
+def territory_vertex_colors(
+    vertices: np.ndarray,
+    territory_map: np.ndarray,
+    affine: np.ndarray,
+    branches: list[dict[str, Any]],
+    default_color,
+) -> list[str]:
+    inverse = np.linalg.inv(affine)
+    voxels = vertices @ inverse[:3, :3].T + inverse[:3, 3]
+    index = np.clip(np.rint(voxels).astype(int), 0, np.asarray(territory_map.shape) - 1)
+    ids = territory_map[index[:, 0], index[:, 1], index[:, 2]]
+    lookup = np.array(
+        [_rgb(default_color)] * (int(territory_map.max()) + 1), dtype=object
+    )
+    for branch in branches:
+        if branch["id"] < lookup.size:
+            lookup[branch["id"]] = _rgb(branch["color"])
+    return lookup[ids].tolist()
+
+
+def build_plan_figure(
+    meshes: dict[str, dict[str, Any]],
+    plan: dict[str, Any],
+    show_territories: bool,
+    show_distances: bool,
+) -> go.Figure:
+    figure = go.Figure()
+    summary = plan["summary"]
+    display = plan["display"]
+    territories = summary["territories"]
+    for name, mesh in meshes.items():
+        if mesh is None:
+            continue
+        color, opacity = PLAN_STYLE[name]
+        vertices, faces = mesh["vertices"], mesh["faces"]
+        trace = {
+            "x": vertices[:, 0],
+            "y": vertices[:, 1],
+            "z": vertices[:, 2],
+            "i": faces[:, 0],
+            "j": faces[:, 1],
+            "k": faces[:, 2],
+            "name": name,
+            "opacity": opacity,
+            "flatshading": False,
+            "lighting": {"ambient": 0.55, "diffuse": 0.75, "specular": 0.25},
+            "hovertemplate": f"{name}<extra></extra>",
+            "showlegend": True,
+        }
+        if (
+            name == "Kidney"
+            and show_territories
+            and territories
+            and display["territory_map"] is not None
+        ):
+            trace["vertexcolor"] = territory_vertex_colors(
+                vertices,
+                display["territory_map"],
+                display["affine"],
+                territories["branches"],
+                color,
+            )
+            trace["opacity"] = 0.55
+            trace["name"] = "Kidney (arterial territories)"
+        else:
+            trace["color"] = _rgb(color)
+        figure.add_trace(go.Mesh3d(**trace))
+
+    if show_territories and territories and display["centerlines"]:
+        colors = {branch["id"]: branch["color"] for branch in territories["branches"]}
+        names = {branch["id"]: branch["name"] for branch in territories["branches"]}
+        for lineage_id, points in display["centerlines"].items():
+            figure.add_trace(
+                go.Scatter3d(
+                    x=points[:, 0],
+                    y=points[:, 1],
+                    z=points[:, 2],
+                    mode="lines",
+                    line={"color": _rgb(colors.get(lineage_id, (255, 255, 255))), "width": 6},
+                    name=names.get(lineage_id, "Proximal artery"),
+                    hoverinfo="name",
+                    showlegend=lineage_id in names,
+                )
+            )
+
+    if show_distances:
+        for name, points in display["distance_lines"].items():
+            gap = summary["distances"][name]["gap_mm"]
+            middle = points.mean(axis=0)
+            figure.add_trace(
+                go.Scatter3d(
+                    x=[points[0, 0], middle[0], points[1, 0]],
+                    y=[points[0, 1], middle[1], points[1, 1]],
+                    z=[points[0, 2], middle[2], points[1, 2]],
+                    mode="lines+markers+text",
+                    text=["", f"{name} {gap:.1f} mm", ""],
+                    textfont={"size": 11, "color": "white"},
+                    marker={"size": 3, "color": "white"},
+                    line={"color": "white", "width": 3, "dash": "dash"},
+                    name=f"Distance: {name}",
+                    showlegend=False,
+                    hoverinfo="text",
+                )
+            )
+
+    figure.update_layout(
+        height=680,
+        margin={"l": 0, "r": 0, "t": 30, "b": 0},
+        legend={"orientation": "h", "y": 1.02, "x": 0.0},
+        scene={
+            "aspectmode": "data",
+            "xaxis_title": "Right ↔ Left (mm)",
+            "yaxis_title": "Anterior ↔ Posterior (mm)",
+            "zaxis_title": "Inferior ↔ Superior (mm)",
+            "camera": {"eye": {"x": 1.4, "y": 1.4, "z": 0.9}},
+        },
+        uirevision="renal-plan",
+    )
+    return figure
+
+
+def _score_tables(summary: dict[str, Any]) -> None:
+    scores = summary["scores"]
+    renal = scores["renal"]
+    padua = scores["padua"]
+    nearness = summary["distances"].get("Collecting system") or summary["distances"].get(
+        "Renal sinus"
+    )
+    nearness_text = f"{nearness['gap_mm']:.1f} mm" if nearness else "not assessable"
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**R.E.N.A.L. components**")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    ("R – max diameter", f"{scores['max_diameter_mm']:.1f} mm", renal["R"]),
+                    (
+                        "E – exophytic",
+                        f"{100 * scores['exophytic_fraction']:.0f} % outside contour",
+                        renal["E"],
+                    ),
+                    (
+                        "N – nearness",
+                        nearness_text,
+                        renal["N"] if renal["N"] is not None else "?",
+                    ),
+                    (
+                        "A – face",
+                        f"{100 * scores['anterior_fraction']:.0f} % anterior",
+                        renal["A"],
+                    ),
+                    (
+                        "L – polar lines",
+                        f"{100 * scores['between_polar_lines_fraction']:.0f} % between lines",
+                        renal["L"],
+                    ),
+                    (
+                        "h – hilar",
+                        "touches main artery/vein" if renal["hilar"] else "—",
+                        "h" if renal["hilar"] else ("?" if renal["hilar"] is None else "—"),
+                    ),
+                ],
+                columns=["Item", "Measurement", "Points"],
+            ).astype(str),
+            hide_index=True,
+            width="stretch",
+        )
+    with right:
+        st.markdown("**PADUA items**")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    (name, "?" if value is None else value)
+                    for name, value in padua["items"].items()
+                ]
+                + [("Face", padua["face"])],
+                columns=["Item", "Points"],
+            ).astype(str),
+            hide_index=True,
+            width="stretch",
+        )
+
+
+def render_plan_tab(
+    *,
+    adapter,
+    dataset_key: str,
+    case,
+    analysis: dict[str, Any],
+    imported_prediction,
+    segmentation_token: str,
+) -> None:
+    st.caption(
+        "Research prototype. Scores are automated approximations of R.E.N.A.L. and PADUA "
+        "computed from the labelmaps; they are not validated and must be checked by a "
+        "qualified clinician."
+    )
+    tumors = analysis.get("tumor_components", [])
+    if case.segmentation is None or not tumors:
+        st.info("A tumour label is required to plan a partial nephrectomy for this case.")
+        return
+
+    planning_labels = planning_segmentation(case, imported_prediction)
+    has_artery = bool(np.any(planning_labels == int(CanonicalLabel.RENAL_ARTERY)))
+
+    controls = st.columns(3)
+    with controls[0]:
+        tumor_index = st.selectbox(
+            "Tumour",
+            list(range(len(tumors))),
+            format_func=lambda index: (
+                f"Tumour {index + 1} · {tumors[index].get('laterality', '')} · "
+                f"{tumors[index]['volume_ml']:.1f} mL"
+            ),
+        )
+    with controls[1]:
+        margin_mm = st.slider(
+            "Resection margin (mm)",
+            0,
+            10,
+            3,
+            help="0 = enucleation. Healthy parenchyma within this distance of the tumour is "
+            "counted as resected.",
+        )
+    with controls[2]:
+        branch_depth = st.selectbox(
+            "Arterial branch level",
+            list(BRANCH_DEPTHS),
+            format_func=BRANCH_DEPTHS.get,
+            disabled=not has_artery,
+            help="Needs renal artery labels (KiPA22) or an imported BA-Net prediction.",
+        )
+
+    plan_key = f"{dataset_key}_{case.case_id}_{segmentation_token}_{tumor_index}_{branch_depth}"
+    if st.button("Compute surgical plan", type="primary", width="stretch", key=f"plan_{plan_key}"):
+        st.session_state[f"plan_ready_{plan_key}"] = True
+    if not st.session_state.get(f"plan_ready_{plan_key}", False):
+        st.info(
+            "Computes nephrometry, distances, contact surface, a resection simulation and — when "
+            "renal arteries are available — approximate arterial territories."
+        )
+        return
+
+    try:
+        with st.spinner("Computing plan geometry on the server…"):
+            geometry = cached_plan_geometry(
+                dataset_key,
+                case.case_id,
+                segmentation_token,
+                int(tumor_index),
+                int(branch_depth),
+                planning_labels,
+                case.affine,
+                case.spacing,
+                case.image,
+            )
+    except PlanningError as exc:
+        st.error(f"Plan could not be computed: {exc}")
+        return
+    plan = assemble_plan(geometry, float(margin_mm))
+    summary = plan["summary"]
+    scores = summary["scores"]
+    resection = summary["resection"]
+
+    cards = st.columns(4)
+    cards[0].metric(
+        "R.E.N.A.L.", scores["renal"]["score"], scores["renal"]["complexity"], delta_color="off"
+    )
+    cards[1].metric("PADUA", scores["padua"]["score"], scores["padua"]["risk"], delta_color="off")
+    cards[2].metric(
+        "Tumour", f"{scores['max_diameter_mm'] / 10:.1f} cm", scores["location"], delta_color="off"
+    )
+    cards[3].metric(
+        "Parenchyma kept",
+        f"{resection['preserved_ipsilateral_pct']:.1f} %",
+        f"{summary['side']} kidney · {resection['technique'].lower()}",
+        delta_color="off",
+    )
+
+    for warning in resection["warnings"]:
+        st.warning(
+            f"{warning['structure']} is {warning['gap_mm']:.1f} mm from the tumour "
+            f"({warning['level']})."
+        )
+
+    _score_tables(summary)
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Distances from tumour surface**")
+        if summary["distances"]:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Structure": name,
+                            "Gap (mm)": round(item["gap_mm"], 1),
+                            "Source": item["source"],
+                        }
+                        for name, item in summary["distances"].items()
+                    ]
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+        contact = summary["contact_surface"]
+        st.caption(
+            f"Tumour–parenchyma contact surface: {contact['contact_cm2']:.1f} cm² of "
+            f"{contact['tumor_surface_cm2']:.1f} cm² tumour surface."
+        )
+    with right:
+        st.markdown("**Resection simulation**")
+        rows = [
+            ("Technique", resection["technique"]),
+            ("Tumour volume", f"{resection['tumor_ml']:.1f} mL"),
+            ("Parenchyma removed", f"{resection['removed_parenchyma_ml']:.1f} mL"),
+            ("Ipsilateral parenchyma kept", f"{resection['preserved_ipsilateral_pct']:.1f} %"),
+            ("Total parenchyma kept", f"{resection['preserved_total_pct']:.1f} %"),
+        ]
+        if resection["ipsilateral_share_before_pct"] is not None:
+            rows.append(
+                (
+                    "Ipsilateral volume share",
+                    f"{resection['ipsilateral_share_before_pct']:.0f} % → "
+                    f"{resection['ipsilateral_share_after_pct']:.0f} %",
+                )
+            )
+        st.dataframe(
+            pd.DataFrame(rows, columns=["Item", "Value"]), hide_index=True, width="stretch"
+        )
+        st.caption("Volume-based; not a prediction of postoperative eGFR.")
+
+    territories = summary["territories"]
+    if territories:
+        st.markdown("**Arterial territories (approximation)**")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Branch": branch["name"],
+                        "Region": branch["region"],
+                        "Parenchyma (mL)": round(branch["parenchyma_ml"], 1),
+                        "Kidney (%)": round(branch["parenchyma_pct"], 0),
+                        "Tumour supplied (%)": round(branch["tumor_pct"], 0),
+                        "Feeds tumour": "Yes" if branch["feeds_tumor"] else "",
+                    }
+                    for branch in territories["branches"]
+                ]
+            ),
+            hide_index=True,
+            width="stretch",
+        )
+        st.info(
+            f"{territories['renal_artery_count']} renal arter"
+            f"{'y' if territories['renal_artery_count'] == 1 else 'ies'} reach the kidney. "
+            f"Selective clamping of {', '.join(territories['feeding_branches']) or '—'} would "
+            f"leave {territories['selective_clamp_ischemic_pct']:.0f} % of parenchyma ischaemic "
+            "versus 100 % with main-artery clamping."
+        )
+        st.caption(territories["method"] + ".")
+    elif not has_artery:
+        st.caption(
+            "Arterial territories need renal artery labels: use a KiPA22 case or import a "
+            "BA-Net prediction from the sidebar."
+        )
+
+    for note in scores["notes"] + [f"Renal sinus: {summary['sinus_source']}."]:
+        st.caption(f"• {note}")
+
+    st.markdown("**3D plan**")
+    view_columns = st.columns(4)
+    with view_columns[0]:
+        quality = st.selectbox("Plan detail", ("Fast", "Balanced", "Detailed"), index=0)
+    with view_columns[1]:
+        show_territories = st.checkbox(
+            "Colour territories", value=bool(territories), disabled=not territories
+        )
+    with view_columns[2]:
+        show_distances = st.checkbox("Distance lines", value=True)
+    with view_columns[3]:
+        show_sinus = st.checkbox("Renal sinus proxy", value=False)
+
+    display = plan["display"]
+    build_key = f"plan3d_{plan_key}_{quality}"
+    if st.button("Build 3D plan", key=f"button_{build_key}", width="stretch"):
+        st.session_state[build_key] = True
+    meshes: dict[str, dict[str, Any] | None] = {}
+    if st.session_state.get(build_key, False):
+        sources = {
+            "Kidney": display["kidney"],
+            "Tumor": display["tumor"],
+            "Resection volume": display["resection"],
+            **display["structures"],
+        }
+        if show_sinus and display["sinus"] is not None:
+            sources["Renal sinus (proxy)"] = display["sinus"]
+        with st.spinner("Building plan surfaces…"):
+            for name, mask in sources.items():
+                key = f"{plan_key}_{margin_mm}" if name == "Resection volume" else plan_key
+                meshes[name] = cached_plan_mesh(
+                    key, name, quality, mask, display["affine"], display["spacing"]
+                )
+        st.plotly_chart(
+            build_plan_figure(meshes, plan, show_territories, show_distances),
+            config={"displaylogo": False, "scrollZoom": True},
+        )
+
+    downloads = st.columns(3)
+    case_label = f"{adapter.info.name} {case.case_id}"
+    center = tumor_center_voxel(plan)
+    axial = render_view(
+        image=case.image,
+        segmentation=case.segmentation,
+        spacing=case.spacing,
+        orientation="Axial",
+        index=int(np.clip(center[2], 0, case.image.shape[2] - 1)),
+        level=60,
+        width=360,
+        visible_labels=[CanonicalLabel.KIDNEY, CanonicalLabel.TUMOR, CanonicalLabel.CYST],
+        overlay_mode="Outline",
+        opacity=0.4,
+    )
+    with downloads[0]:
+        st.download_button(
+            "Plan report (PDF)",
+            data=plan_report_pdf(
+                summary, case_label, images=[("Axial slice through tumour centre", axial)]
+            ),
+            file_name=f"{dataset_key}_{case.case_id}_tumor{tumor_index + 1}_plan.pdf",
+            mime="application/pdf",
+            width="stretch",
+        )
+    with downloads[1]:
+        st.download_button(
+            "Plan data (JSON)",
+            data=json.dumps(summary, indent=2, default=_json_default),
+            file_name=f"{dataset_key}_{case.case_id}_tumor{tumor_index + 1}_plan.json",
+            mime="application/json",
+            width="stretch",
+        )
+    with downloads[2]:
+        available = {name: mesh for name, mesh in meshes.items() if mesh is not None}
+        st.download_button(
+            "3D surfaces (STL zip)",
+            data=stl_zip(available) if available else b"",
+            file_name=f"{dataset_key}_{case.case_id}_tumor{tumor_index + 1}_surfaces.zip",
+            mime="application/zip",
+            width="stretch",
+            disabled=not available,
+            help="Build the 3D plan first. Files share RAS millimetre coordinates.",
+        )

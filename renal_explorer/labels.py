@@ -18,6 +18,7 @@ class CanonicalLabel(IntEnum):
     RENAL_VEIN = 5
     AORTA = 6
     IVC = 7
+    COLLECTING_SYSTEM = 8
 
 
 LABEL_NAMES = {
@@ -28,6 +29,7 @@ LABEL_NAMES = {
     CanonicalLabel.RENAL_VEIN: "Renal vein",
     CanonicalLabel.AORTA: "Aorta",
     CanonicalLabel.IVC: "Inferior vena cava",
+    CanonicalLabel.COLLECTING_SYSTEM: "Collecting system",
 }
 
 
@@ -39,4 +41,5 @@ LABEL_COLORS = {
     CanonicalLabel.RENAL_VEIN: (75, 115, 255),
     CanonicalLabel.AORTA: (225, 55, 95),
     CanonicalLabel.IVC: (85, 165, 255),
+    CanonicalLabel.COLLECTING_SYSTEM: (250, 235, 120),
 }

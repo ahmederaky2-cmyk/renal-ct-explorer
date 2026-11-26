@@ -53,6 +53,35 @@ case ID, source CT SHA-256, dimensions, affine, labels, model source, and resear
 are checked by Streamlit before the artery/vein overlay is accepted. Imported predictions are
 kept separate from dataset annotations in measurements and exports.
 
+## Surgical plan tab (research prototype)
+
+The **Surgical plan** tab turns the labelmaps into a partial nephrectomy planning summary for
+one selected tumour. Everything is computed in physical millimetres on a crop around that
+tumour's kidney (`renal_explorer/planning.py`).
+
+| Output | How it is computed |
+|---|---|
+| R.E.N.A.L. (R, E, N, A, L, h) | Max diameter from the tumour hull; exophytic fraction outside a 15 mm Euclidean closing of the parenchyma; nearness to the collecting system label or, if absent, an image-derived renal sinus proxy; anterior/posterior and polar lines along the kidney's own principal axes; *h* only when the tumour touches artery/vein outside the parenchyma |
+| PADUA | Same geometry; items that need missing labels (e.g. collecting system) are shown as `?` and the score is reported as a range |
+| Distances | Shortest tumour-surface gap to sinus, collecting system, renal artery/vein, aorta and IVC, drawn as lines in 3D |
+| Contact surface | Area of the tumour surface touching parenchyma (marching-cubes mesh) |
+| Resection simulation | Margin slider (0 = enucleation) → parenchyma removed, ipsilateral and total parenchyma kept, structures inside or within 2 mm of the margin |
+| Arterial territories | When renal arteries are labelled (KiPA22) or imported (BA-Net): centreline tree, significant bifurcations that reach the kidney, nearest-branch territories, tumour-feeding branches and ischaemic volume for selective vs main-artery clamping |
+| Exports | PDF plan report, JSON plan data, STL surfaces in shared RAS millimetre coordinates for 3D printing or AR |
+
+Known limitations, stated in the interface as well:
+
+- Scores are unvalidated automated approximations; they need comparison against expert scoring
+  before any claim of agreement.
+- Without a collecting system label, N and the PADUA collecting-system item use a renal sinus
+  proxy (non-parenchymal fat/urine inside the renal envelope).
+- Territories are a nearest-branch (Voronoi) approximation, not a perfusion study.
+- Preserved volume is not a prediction of postoperative eGFR.
+
+On a 512 × 512 × 420 synthetic CT the plan geometry is computed in about 3 seconds with
+roughly 600 MB of working memory on top of the loaded volume. Margin changes reuse the cached
+geometry. Phantom-based tests live in `tests/test_planning.py`.
+
 ## 3D quality architecture
 
 The 3D pipeline is designed around measurable geometric fidelity, not only a smooth-looking

@@ -21,6 +21,7 @@ from renal_explorer.analysis import analyze_case, histogram_table  # noqa: E402
 from renal_explorer.datasets import DATASETS, DatasetError, get_adapter  # noqa: E402
 from renal_explorer.labels import LABEL_COLORS, LABEL_NAMES, CanonicalLabel  # noqa: E402
 from renal_explorer.models import CaseFiles  # noqa: E402
+from renal_explorer.plan_ui import render_plan_tab  # noqa: E402
 from renal_explorer.prediction_packages import (  # noqa: E402
     PredictionPackageError,
     load_banet_prediction_package,
@@ -69,6 +70,7 @@ LABEL_OPACITY = {
     CanonicalLabel.RENAL_VEIN: 0.90,
     CanonicalLabel.AORTA: 0.65,
     CanonicalLabel.IVC: 0.65,
+    CanonicalLabel.COLLECTING_SYSTEM: 0.85,
 }
 
 
@@ -672,9 +674,18 @@ def main() -> None:
     if visible_labels and overlay_mode != "Off":
         st.markdown(legend_html(visible_labels), unsafe_allow_html=True)
 
-    tab_measurements, tab_3d, tab_histogram, tab_export, tab_source = st.tabs(
-        ["Measurements", "Interactive 3D", "HU histogram", "Export", "Source"]
+    tab_plan, tab_measurements, tab_3d, tab_histogram, tab_export, tab_source = st.tabs(
+        ["Surgical plan", "Measurements", "Interactive 3D", "HU histogram", "Export", "Source"]
     )
+    with tab_plan:
+        render_plan_tab(
+            adapter=adapter,
+            dataset_key=dataset_key,
+            case=case,
+            analysis=analysis,
+            imported_prediction=imported_prediction,
+            segmentation_token=segmentation_cache_token,
+        )
     with tab_measurements:
         if not regions:
             st.info("This case has no mapped segmentation file.")
