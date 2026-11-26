@@ -71,6 +71,9 @@ def test_components_get_laterality_and_physical_distance() -> None:
     segmentation[1:4, 2:6, 1:5] = int(CanonicalLabel.KIDNEY)
     segmentation[8:11, 2:6, 1:5] = int(CanonicalLabel.KIDNEY)
     segmentation[9:11, 3:5, 2:4] = int(CanonicalLabel.TUMOR)
+    # Laterality now comes from anatomy (aorta/IVC or two kidney-sized organs), never the
+    # image centre; these toy blocks need the aorta between them as reference.
+    segmentation[5:7, 3:5, 1:5] = int(CanonicalLabel.AORTA)
     result = analyze_case(synthetic_case(segmentation))
     sides = {component["laterality"] for component in result["kidney_components"]}
     assert sides == {"Left", "Right"}

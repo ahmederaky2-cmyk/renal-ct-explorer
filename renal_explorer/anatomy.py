@@ -55,32 +55,35 @@ def x_extent(mask: np.ndarray, affine: np.ndarray) -> tuple[float, float] | None
     return float(xs.min()), float(xs.max())
 
 
+MIN_KIDNEY_ML = 40.0  # smaller pieces are not trusted as a separate kidney
+MIN_KIDNEY_GAP_MM = 30.0  # left and right kidneys are separated by the spine and psoas
+
+
 def kidney_reference_x(
     components: Sequence[dict[str, float]], midline_x: float | None
 ) -> tuple[float | None, str]:
     """Reference x separating right from left, and how it was found.
 
     ``components`` are kidney components with keys ``x`` (centroid), ``x_min``, ``x_max``
-    and ``volume``. Priority:
+    and ``volume`` (mL). Priority:
 
     1. the aorta/IVC midline;
-    2. two substantial kidney components whose x ranges do not overlap (left and right
-       kidneys never overlap left-to-right; pieces of one kidney almost always do);
-    3. nothing: laterality is Unknown. A wrong side is worse than no side.
+    2. exactly two kidney-sized components (each ≥ ``MIN_KIDNEY_ML``) whose x ranges are at
+       least ``MIN_KIDNEY_GAP_MM`` apart. A piece of the same kidney, even a large one,
+       does not sit a spine's width away from it;
+    3. anything else (one kidney, fragments, three pieces): Unknown. A wrong side is
+       worse than no side, and split volumes are then withheld.
     """
 
     if midline_x is not None:
         return midline_x, "great vessels"
-    if len(components) < 2:
+    kidneys = [item for item in components if item["volume"] >= MIN_KIDNEY_ML]
+    if len(kidneys) != 2:
         return None, "unknown"
-    ordered = sorted(components, key=lambda item: item["volume"], reverse=True)
-    largest = ordered[0]
-    for other in ordered[1:]:
-        if other["volume"] < 0.25 * largest["volume"]:
-            break
-        if other["x_min"] > largest["x_max"] or other["x_max"] < largest["x_min"]:
-            return 0.5 * (largest["x"] + other["x"]), "both kidneys"
-    return None, "unknown"
+    first, second = sorted(kidneys, key=lambda item: item["x"])
+    if second["x_min"] - first["x_max"] < MIN_KIDNEY_GAP_MM:
+        return None, "unknown"
+    return 0.5 * (first["x"] + second["x"]), "both kidneys"
 
 
 def kidney_sides(

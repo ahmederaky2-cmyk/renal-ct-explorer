@@ -100,8 +100,13 @@ def source_fingerprint(source: Path) -> str:
     return digest.hexdigest()
 
 
-def record_inbox_source(raw_dir: Path, source: Path) -> None:
-    record = {"path": str(source), "fingerprint": source_fingerprint(source)}
+def record_inbox_source(raw_dir: Path, source: Path, fingerprint: str | None = None) -> None:
+    """Remember which inbox item may be deleted after conversion.
+
+    Pass the fingerprint taken *before* copying; the caller checks it again after the copy.
+    """
+
+    record = {"path": str(source), "fingerprint": fingerprint or source_fingerprint(source)}
     (raw_dir / SOURCE_RECORD).write_text(json.dumps(record))
 
 

@@ -332,6 +332,8 @@ def test_intrarenal_fragment_is_not_an_accessory_artery() -> None:
         CanonicalLabel.RENAL_ARTERY
     )
     territories = build_plan(segmentation, affine, SPACING, image)["summary"]["territories"]
+    assert territories["selective_clamp_ischemic_pct"] is None  # withheld, also in JSON
+    assert territories["selective_clamp_ischemic_ml"] is None
     assert territories["ignored_fragments"] == 1
     assert territories["renal_artery_count"] == 1
     assert not any(branch["accessory"] for branch in territories["branches"])
@@ -389,9 +391,16 @@ def test_kidney_reference_rules() -> None:
     left = {"x": -80.0, "x_min": -110.0, "x_max": -50.0, "volume": 150.0}
     right = {"x": 80.0, "x_min": 50.0, "x_max": 110.0, "volume": 140.0}
     left_piece = {"x": -70.0, "x_min": -95.0, "x_max": -45.0, "volume": 60.0}
+    # Re-review case: a same-side piece beside the kidney with disjoint x range (33.7 mL).
+    lateral_piece = {"x": -125.0, "x_min": -135.0, "x_max": -112.0, "volume": 33.67}
+    big_lateral_piece = {**lateral_piece, "volume": 60.0}
     assert kidney_reference_x([left, right], None) == (0.0, "both kidneys")
     assert kidney_reference_x([left, left_piece], None) == (None, "unknown")
-    assert kidney_sides([left, left_piece, right], None) == ["Left", "Left", "Right"]
+    assert kidney_reference_x([left, lateral_piece], None) == (None, "unknown")
+    assert kidney_reference_x([left, big_lateral_piece], None) == (None, "unknown")  # gap 2 mm
+    assert kidney_sides([left, left_piece, right], None) == ["Unknown"] * 3  # ambiguous
+    small_piece = {**left_piece, "volume": 10.0}  # too small to be a kidney: ignored
+    assert kidney_sides([left, small_piece, right], None) == ["Left", "Left", "Right"]
     assert kidney_sides([left, left_piece], -20.0) == ["Left", "Left"]
     assert kidney_sides([left], None) == ["Unknown"]
 
@@ -406,8 +415,48 @@ def test_legacy_toy_kidneys_still_get_sides() -> None:
     segmentation[1:4, 2:6, 1:5] = int(CanonicalLabel.KIDNEY)
     segmentation[8:11, 2:6, 1:5] = int(CanonicalLabel.KIDNEY)
     segmentation[9:11, 3:5, 2:4] = int(CanonicalLabel.TUMOR)
+    # Toy blocks are far too small to count as kidneys on their own; the aorta between
+    # them gives the anatomical reference.
+    segmentation[5:7, 3:5, 1:5] = int(CanonicalLabel.AORTA)
     image = np.arange(segmentation.size, dtype=np.float32).reshape(segmentation.shape)
     case = VolumeCase("t", "c", image, segmentation, (2.0, 1.0, 3.0), np.diag([2.0, 1.0, 3.0, 1.0]))
     result = analyze_case(case)
     assert {kidney["laterality"] for kidney in result["kidney_components"]} == {"Left", "Right"}
     assert result["tumor_components"][0]["nearest_kidney"] == "Right"
+
+
+def test_lateral_same_side_fragment_never_makes_the_plan_right() -> None:
+    """Regression (third review): a 33.7 mL left fragment gave 'Right' and fake split volume."""
+
+    tumor_center = (CENTER_MM[0] - 14.0, CENTER_MM[1], CENTER_MM[2])
+    segmentation, image, affine = phantom(tumor_center, 7.0)
+    segmentation[100:] = 0  # no right kidney, no great vessels
+    fragment = _ellipsoid((7.0, CENTER_MM[1], CENTER_MM[2]), (5.0, 18.0, 60.0))
+    fragment &= segmentation == 0
+    segmentation[fragment] = int(CanonicalLabel.KIDNEY)  # separate piece, disjoint x range
+    summary = build_plan(segmentation, affine, SPACING, image)["summary"]
+    assert summary["side"] == "Unknown"
+    assert summary["resection"]["contralateral_parenchyma_ml"] == 0.0
+    assert summary["resection"]["ipsilateral_share_before_pct"] is None
+
+
+def test_demo_resolution_is_marked_in_pdf_and_stl() -> None:
+    import io
+    import zipfile
+
+    from renal_explorer.exports import plan_report_pdf, stl_zip
+
+    tumor_center = (CENTER_MM[0] - 23.0, CENTER_MM[1], CENTER_MM[2] + 32.0)
+    segmentation, image, affine = phantom(tumor_center, 12.0)
+    summary = build_plan(segmentation, affine, SPACING, image)["summary"]
+    assert np.allclose(summary["tumor_center_mm"], tumor_center, atol=2.0)
+    summary["resolution"] = {
+        "reduced": True,
+        "spacing_mm": [1.56, 1.56, 1.5],
+        "full_spacing_mm": [0.78, 0.78, 0.5],
+    }
+    assert plan_report_pdf(summary, "demo").startswith(b"%PDF")
+    mesh = {"vertices": np.eye(3), "faces": np.array([[0, 1, 2]])}
+    payload = stl_zip({"Tumor": mesh}, resolution=summary["resolution"])
+    archive = zipfile.ZipFile(io.BytesIO(payload))
+    assert "DEMO RESOLUTION" in archive.read("README.txt").decode()

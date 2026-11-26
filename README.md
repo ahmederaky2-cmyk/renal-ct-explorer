@@ -57,9 +57,12 @@ kept separate from dataset annotations in measurements and exports.
 ## Demo resolution on the free server
 
 The **Online demo** reads each scan at about 1.5 mm (`RENAL_DEMO_SPACING_MM`, `0` turns this
-off). Decimation happens while the file is read, so the full-resolution volume is never held
-in memory, and a banner says that measurements are approximate. Imported BA-Net predictions
-are verified against the full-resolution geometry and then reduced exactly like the CT.
+off). Each file is sampled on the same canonical grid while it is read, so the full-resolution
+float volume is never built; nibabel may still read much of the compressed file. On KiTS23
+case_00001 the review measured a peak of 0.61 GiB in demo mode against 2.9 GiB at full
+resolution. Plans, PDFs, JSON and STL exports made at demo resolution are marked as such.
+Imported BA-Net predictions are verified against the full-resolution geometry and then
+reduced like the CT; that verification still briefly needs memory for the full-size labels.
 **Patient mode and server datasets always load at full resolution**, as do the validation
 scripts.
 

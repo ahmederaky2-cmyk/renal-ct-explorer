@@ -38,8 +38,25 @@ def _safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_").lower() or "surface"
 
 
-def stl_zip(meshes: dict[str, dict[str, Any]], readme: str = "") -> bytes:
+def stl_zip(
+    meshes: dict[str, dict[str, Any]],
+    readme: str = "",
+    resolution: dict[str, Any] | None = None,
+) -> bytes:
     """Zip of one STL per structure. ``meshes`` maps display name -> mesh dict."""
+
+    if not readme:
+        readme = (
+            "Research-only surfaces exported from Renal CT Research Explorer.\n"
+            "Coordinates are RAS millimetres; all files share one coordinate frame, so they\n"
+            "line up when imported together. Not a medical device. Not for clinical use.\n"
+        )
+    if resolution and resolution.get("reduced"):
+        readme += (
+            "\nDEMO RESOLUTION: built from a reduced grid "
+            f"({resolution.get('spacing_mm')} mm, full {resolution.get('full_spacing_mm')} mm). "
+            "Shapes and sizes are approximate.\n"
+        )
 
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -49,15 +66,7 @@ def stl_zip(meshes: dict[str, dict[str, Any]], readme: str = "") -> bytes:
             archive.writestr(
                 f"{_safe_name(name)}.stl", stl_bytes(mesh["vertices"], mesh["faces"], name)
             )
-        archive.writestr(
-            "README.txt",
-            readme
-            or (
-                "Research-only surfaces exported from Renal CT Research Explorer.\n"
-                "Coordinates are RAS millimetres; all files share one coordinate frame, so they\n"
-                "line up when imported together. Not a medical device. Not for clinical use.\n"
-            ),
-        )
+        archive.writestr("README.txt", readme)
     return buffer.getvalue()
 
 
@@ -71,6 +80,10 @@ def _fmt(value: Any, digits: int = 1, suffix: str = "") -> str:
     if isinstance(value, (float, np.floating)):
         return f"{float(value):.{digits}f}{suffix}"
     return f"{value}{suffix}"
+
+
+def _fmt_list(values) -> str:
+    return " × ".join(f"{float(value):.2f}" for value in values) if values else "?"
 
 
 def _n_range(renal: dict[str, Any]) -> str:
@@ -149,6 +162,20 @@ def plan_report_pdf(
             "<b>Research software. Not a medical device. Automated scores are unvalidated "
             "approximations and must be checked by a qualified clinician.</b>",
             styles["Normal"],
+        ),
+        *(
+            [
+                Spacer(1, 2 * mm),
+                Paragraph(
+                    "<b>DEMO RESOLUTION:</b> computed on a reduced grid "
+                    f"({_fmt_list(summary['resolution'].get('spacing_mm'))} mm instead of "
+                    f"{_fmt_list(summary['resolution'].get('full_spacing_mm'))} mm). "
+                    "Volumes, distances and scores are approximate.",
+                    styles["Normal"],
+                ),
+            ]
+            if (summary.get("resolution") or {}).get("reduced")
+            else []
         ),
         Spacer(1, 4 * mm),
         Paragraph("Nephrometry", styles["Heading2"]),

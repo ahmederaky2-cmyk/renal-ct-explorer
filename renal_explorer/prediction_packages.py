@@ -165,14 +165,19 @@ def load_banet_prediction_package(
     if not np.allclose(prediction_nii.affine, expected_affine, atol=1e-3):
         raise PredictionPackageError("Prediction and CT affine matrices do not match.")
     source = np.asanyarray(prediction_nii.dataobj)
-    if not np.all(np.isfinite(source)) or not np.allclose(source, np.rint(source)):
-        raise PredictionPackageError("Prediction labels must be finite integer values.")
-    source = np.rint(source).astype(np.int16, copy=False)
-    unexpected = set(int(value) for value in np.unique(source)).difference({0, 1, 2, 3, 4})
-    if unexpected:
+    if not np.issubdtype(source.dtype, np.integer):
+        # Float storage: check integrality slab by slab to avoid full float64 copies.
+        for start in range(0, source.shape[2], 16):
+            slab = source[:, :, start : start + 16]
+            if not np.all(np.isfinite(slab)) or not np.array_equal(slab, np.rint(slab)):
+                raise PredictionPackageError("Prediction labels must be finite integer values.")
+    # BA-Net labels are 0-4; a range check avoids sorting the volume (np.unique).
+    if source.size and (source.min() < 0 or source.max() > 4):
+        found = np.unique(source[(source < 0) | (source > 4)])
         raise PredictionPackageError(
-            f"Prediction contains unexpected BA-Net labels: {sorted(unexpected)}."
+            f"Prediction contains unexpected BA-Net labels: {sorted(int(v) for v in found)}."
         )
+    source = source.astype(np.uint8, copy=False)
 
     canonical = np.zeros(expected_shape, dtype=np.uint8)
     canonical[source == 1] = int(CanonicalLabel.RENAL_VEIN)

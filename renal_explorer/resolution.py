@@ -1,8 +1,15 @@
 """Reduced-resolution loading for the free public demo.
 
 The public Streamlit server has little memory, so the *Online demo* reads every scan at
-about 1.5 mm. Decimation happens while reading (strided slices of the NIfTI proxy, before
-reorientation), so the full-resolution volume is never held in memory.
+about 1.5 mm. Each file is read with strided slices of its NIfTI proxy before reorientation.
+nibabel may still read much of the compressed stream, but the full-resolution float volume
+is never built.
+
+The sampling grid is defined in canonical (RAS) voxel space: canonical index 0, s, 2s, … on
+every axis. Each file is sliced on its own native axes so that it lands on exactly that grid
+(flipped axes start at ``(n - 1) % s``). The CT, its labels and any full-resolution
+prediction therefore always keep the same voxels, and reducing a canonical array is plain
+slicing.
 
 Patient mode and server datasets always load at full resolution: measurements used for
 planning must never come from a reduced grid.
@@ -49,21 +56,8 @@ def decimation_strides(zooms, target_mm: float | None) -> tuple[int, int, int]:
     )
 
 
-def read_reduced(image, strides: tuple[int, int, int]):
-    """A strided copy of a nibabel image, read lazily from its data proxy."""
-
-    import nibabel as nib
-
-    if strides == (1, 1, 1):
-        return image
-    step = tuple(slice(None, None, value) for value in strides)
-    data = np.asanyarray(image.dataobj[step])
-    affine = np.asarray(image.affine, dtype=float) @ np.diag([*strides, 1.0])
-    return nib.Nifti1Image(data, affine, header=None)
-
-
 def full_canonical_geometry(image) -> dict[str, Any]:
-    """Shape/affine that ``nib.as_closest_canonical`` would give, without loading data."""
+    """Shape/affine/spacing that ``nib.as_closest_canonical`` gives, without loading data."""
 
     from nibabel import orientations
 
@@ -73,27 +67,60 @@ def full_canonical_geometry(image) -> dict[str, Any]:
     for source_axis, (target_axis, _flip) in enumerate(orientation):
         canonical_shape[int(target_axis)] = shape[source_axis]
     affine = np.asarray(image.affine, dtype=float) @ orientations.inv_ornt_aff(orientation, shape)
+    spacing = np.sqrt((affine[:3, :3] ** 2).sum(axis=0))
     return {
         "shape": tuple(canonical_shape),
         "affine": affine,
-        "orientation": orientation.tolist(),
+        "spacing": tuple(float(value) for value in spacing),
+        "orientation": orientation,
     }
 
 
-def reduce_canonical_like(array: np.ndarray, resolution: dict[str, Any]) -> np.ndarray:
-    """Apply the demo's decimation to a full-resolution canonical array.
+def read_reduced(image, canonical_strides: tuple[int, int, int]):
+    """Strided copy of a nibabel image that lands on the canonical grid 0, s, 2s, …"""
 
-    Used for imported predictions, which are verified against the full-resolution CT
-    geometry and must then land on exactly the voxels that the reduced CT kept.
-    """
-
+    import nibabel as nib
     from nibabel import orientations
 
-    strides = tuple(resolution["strides"])
+    if tuple(canonical_strides) == (1, 1, 1):
+        return image
+    orientation = orientations.io_orientation(image.affine)
+    shape = image.shape[:3]
+    slices = []
+    starts = []
+    steps = []
+    for axis in range(3):
+        canonical_axis = int(orientation[axis, 0])
+        step = int(canonical_strides[canonical_axis])
+        flipped = orientation[axis, 1] < 0
+        start = (shape[axis] - 1) % step if flipped else 0
+        slices.append(slice(start, None, step))
+        starts.append(start)
+        steps.append(step)
+    data = np.asanyarray(image.dataobj[tuple(slices)])
+    shift = np.eye(4)
+    shift[:3, 3] = starts
+    affine = np.asarray(image.affine, dtype=float) @ shift @ np.diag([*steps, 1.0])
+    return nib.Nifti1Image(data, affine)
+
+
+def reduce_canonical_like(array: np.ndarray, resolution: dict[str, Any]) -> np.ndarray:
+    """Apply the demo's sampling to a full-resolution canonical array (plain slicing)."""
+
+    strides = tuple(int(value) for value in resolution.get("strides", (1, 1, 1)))
     if strides == (1, 1, 1):
         return array
-    orientation = np.asarray(resolution["orientation"], dtype=float)
-    to_original = orientations.ornt_transform(orientations.axcodes2ornt("RAS"), orientation)
-    original = orientations.apply_orientation(array, to_original)
-    reduced = original[tuple(slice(None, None, value) for value in strides)]
-    return np.ascontiguousarray(orientations.apply_orientation(reduced, orientation))
+    return np.ascontiguousarray(array[tuple(slice(None, None, step) for step in strides)])
+
+
+def grid_token(shape, affine, resolution: dict[str, Any] | None = None) -> str:
+    """Short identity of a voxel grid, for cache keys (same file, different grid ≠ same)."""
+
+    import hashlib
+
+    digest = hashlib.sha1()
+    digest.update(str(tuple(int(value) for value in shape)).encode())
+    digest.update(np.round(np.asarray(affine, dtype=float), 4).tobytes())
+    strides = tuple(int(value) for value in (resolution or {}).get("strides", (1, 1, 1)))
+    digest.update(str(strides).encode())
+    return digest.hexdigest()[:12]

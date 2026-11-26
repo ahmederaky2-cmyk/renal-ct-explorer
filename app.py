@@ -35,7 +35,6 @@ from renal_explorer.patient_ui import (  # noqa: E402
     select_patient_case,
 )
 from renal_explorer.plan_ui import render_plan_tab  # noqa: E402
-from renal_explorer.resolution import demo_target_spacing, reduce_canonical_like  # noqa: E402
 from renal_explorer.prediction_packages import (  # noqa: E402
     PredictionPackageError,
     load_banet_prediction_package,
@@ -50,6 +49,11 @@ from renal_explorer.rendering import (  # noqa: E402
     VIEW_AXES,
     legend_html,
     render_view,
+)
+from renal_explorer.resolution import (  # noqa: E402
+    demo_target_spacing,
+    grid_token,
+    reduce_canonical_like,
 )
 from renal_explorer.three_d import (  # noqa: E402
     candidate_vessel_mesh,
@@ -234,16 +238,26 @@ def cached_prediction_package(
     expected_affine_values: tuple[float, ...],
     expected_image_sha256: str,
     _payload: bytes,
+    reduce_strides: tuple[int, int, int] | None = None,
 ):
     del package_sha256
     affine = np.asarray(expected_affine_values, dtype=float).reshape(4, 4)
-    return load_banet_prediction_package(
+    prediction = load_banet_prediction_package(
         _payload,
         expected_case_id,
         expected_shape,
         affine,
         expected_image_sha256,
     )
+    if reduce_strides:
+        # Demo: verified on the full grid, then only the reduced array is kept in cache.
+        prediction = dataclasses.replace(
+            prediction,
+            segmentation=reduce_canonical_like(
+                prediction.segmentation, {"strides": reduce_strides}
+            ),
+        )
+    return prediction
 
 
 def build_3d_figure(
@@ -569,14 +583,12 @@ def main() -> None:
                             tuple(float(value) for value in expected_affine.ravel()),
                             image_digest,
                             prediction_payload,
+                            (
+                                tuple(int(value) for value in resolution["strides"])
+                                if resolution.get("reduced")
+                                else None
+                            ),
                         )
-                        if resolution.get("reduced"):
-                            imported_prediction = dataclasses.replace(
-                                imported_prediction,
-                                segmentation=reduce_canonical_like(
-                                    imported_prediction.segmentation, resolution
-                                ),
-                            )
                     provenance = imported_prediction.provenance
                     st.success(
                         "Verified BA-Net prediction · "
@@ -605,9 +617,12 @@ def main() -> None:
             for label in CanonicalLabel
             if label != CanonicalLabel.BACKGROUND and int(label) in present
         ]
+    # Grid identity is part of every derived cache key: the same file loaded at demo and at
+    # full resolution must never share plans, meshes or slice positions (review finding).
     segmentation_cache_token = (
         f"{file_signature(segmentation_path)}:"
-        f"{imported_prediction.package_sha256 if imported_prediction else 'source'}"
+        f"{imported_prediction.package_sha256 if imported_prediction else 'source'}:"
+        f"{grid_token(case.image.shape, case.affine, case.metadata.get('resolution'))}"
     )
 
     with st.sidebar:

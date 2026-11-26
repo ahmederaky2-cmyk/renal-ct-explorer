@@ -12,7 +12,7 @@ import streamlit as st
 
 from .exports import plan_report_pdf, stl_zip
 from .labels import LABEL_COLORS, CanonicalLabel
-from .planning import PlanningError, assemble_plan, plan_geometry, tumor_center_voxel
+from .planning import PlanningError, assemble_plan, plan_geometry
 from .rendering import render_view
 from .three_d import surface_mesh
 
@@ -367,6 +367,19 @@ def render_plan_tab(
         st.error(f"Plan could not be computed: {exc}")
         return
     plan = assemble_plan(geometry, float(margin_mm))
+    resolution = case.metadata.get("resolution") or {"reduced": False}
+    plan["summary"]["resolution"] = {
+        "reduced": bool(resolution.get("reduced")),
+        "spacing_mm": [float(value) for value in case.spacing],
+        "full_spacing_mm": resolution.get("full_spacing_mm"),
+        "strides": resolution.get("strides", [1, 1, 1]),
+    }
+    if plan["summary"]["resolution"]["reduced"]:
+        st.warning(
+            "Demo resolution: this plan is computed on a reduced grid "
+            f"({', '.join(f'{value:.1f}' for value in case.spacing)} mm). Exports are marked "
+            "as approximate."
+        )
     summary = plan["summary"]
     scores = summary["scores"]
     resection = summary["resection"]
@@ -521,7 +534,11 @@ def render_plan_tab(
 
     downloads = st.columns(3)
     case_label = f"{adapter.info.name} {case.case_id}"
-    center = tumor_center_voxel(plan)
+    # Slice from the tumour's world position mapped onto the case's current grid.
+    inverse = np.linalg.inv(case.affine)
+    center_world = np.append(np.asarray(summary["tumor_center_mm"], dtype=float), 1.0)
+    center = np.rint((inverse @ center_world)[:3]).astype(int)
+    reduced_suffix = "_demo-resolution" if summary["resolution"]["reduced"] else ""
     axial = render_view(
         image=case.image,
         segmentation=case.segmentation,
@@ -540,7 +557,9 @@ def render_plan_tab(
             data=plan_report_pdf(
                 summary, case_label, images=[("Axial slice through tumour centre", axial)]
             ),
-            file_name=f"{dataset_key}_{case.case_id}_tumor{tumor_index + 1}_plan.pdf",
+            file_name=(
+                f"{dataset_key}_{case.case_id}_tumor{tumor_index + 1}_plan{reduced_suffix}.pdf"
+            ),
             mime="application/pdf",
             width="stretch",
         )
@@ -548,7 +567,9 @@ def render_plan_tab(
         st.download_button(
             "Plan data (JSON)",
             data=json.dumps(summary, indent=2, default=_json_default),
-            file_name=f"{dataset_key}_{case.case_id}_tumor{tumor_index + 1}_plan.json",
+            file_name=(
+                f"{dataset_key}_{case.case_id}_tumor{tumor_index + 1}_plan{reduced_suffix}.json"
+            ),
             mime="application/json",
             width="stretch",
         )
@@ -556,8 +577,11 @@ def render_plan_tab(
         available = {name: mesh for name, mesh in meshes.items() if mesh is not None}
         st.download_button(
             "3D surfaces (STL zip)",
-            data=stl_zip(available) if available else b"",
-            file_name=f"{dataset_key}_{case.case_id}_tumor{tumor_index + 1}_surfaces.zip",
+            data=stl_zip(available, resolution=summary["resolution"]) if available else b"",
+            file_name=(
+                f"{dataset_key}_{case.case_id}_tumor{tumor_index + 1}"
+                f"_surfaces{reduced_suffix}.zip"
+            ),
             mime="application/zip",
             width="stretch",
             disabled=not available,

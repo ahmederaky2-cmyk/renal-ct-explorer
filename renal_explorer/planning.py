@@ -586,24 +586,35 @@ def nephrometry(unit: RenalUnit, distances: dict[str, Any]) -> dict[str, Any]:
     tumor_long = _projections(unit, unit.tumor, "long")
     renal_long = _projections(unit, unit.kidney | unit.tumor, "long")
     midline = 0.5 * (float(renal_long.min()) + float(renal_long.max()))
+    crosses_midline = float(tumor_long.min()) < midline < float(tumor_long.max())
+
+    def polar_points(lower: float, upper: float) -> tuple[int, float]:
+        fraction = float(np.mean((tumor_long >= lower) & (tumor_long <= upper)))
+        if fraction <= 0.01:
+            return 1, fraction
+        if fraction > 0.5 or crosses_midline or fraction >= 0.99:
+            return 3, fraction
+        return 2, fraction
+
+    span = float(renal_long.max() - renal_long.min())
+    thirds = (float(renal_long.min()) + span / 3.0, float(renal_long.max()) - span / 3.0)
+    l_thirds, _thirds_fraction = polar_points(*thirds)
     if unit.sinus is not None:
         sinus_long = _projections(unit, unit.sinus, "long")
-        lower_line, upper_line = np.percentile(sinus_long, [1, 99])
-        polar_source = "renal sinus extent"
+        lower_line, upper_line = (float(value) for value in np.percentile(sinus_long, [1, 99]))
+        polar_source = "renal sinus proxy extent"
     else:
-        span = float(renal_long.max() - renal_long.min())
-        lower_line = float(renal_long.min()) + span / 3.0
-        upper_line = float(renal_long.max()) - span / 3.0
+        lower_line, upper_line = thirds
         polar_source = "kidney thirds (no sinus proxy)"
-        notes.append("Polar lines approximated by kidney thirds.")
-    between_fraction = float(np.mean((tumor_long >= lower_line) & (tumor_long <= upper_line)))
-    crosses_midline = float(tumor_long.min()) < midline < float(tumor_long.max())
-    if between_fraction <= 0.01:
-        l_points = 1
-    elif between_fraction > 0.5 or crosses_midline or between_fraction >= 0.99:
-        l_points = 3
-    else:
-        l_points = 2
+    l_points, between_fraction = polar_points(lower_line, upper_line)
+    # Polar lines never come from a reviewed outline: report L as an estimate within the
+    # range spanned by the sinus-proxy lines and a kidney-thirds check (review finding).
+    l_range = [min(l_points, l_thirds), max(l_points, l_thirds)]
+    if l_range[0] != l_range[1]:
+        notes.append(
+            f"L is {l_range[0]}–{l_range[1]}: polar lines from the sinus proxy and from kidney "
+            "thirds disagree; check the polar lines on the images."
+        )
     tumor_center_long = float(np.mean(tumor_long))
     if tumor_center_long > upper_line:
         pole = "Upper pole"
@@ -625,11 +636,11 @@ def nephrometry(unit: RenalUnit, distances: dict[str, Any]) -> dict[str, Any]:
     else:
         notes.append("Hilar (h) suffix not assessable without renal artery/vein labels.")
 
-    base_points = r_points + e_points + l_points
-    renal_total_min = base_points + (n_points if n_points is not None else n_low)
-    renal_total_max = base_points + (n_points if n_points is not None else n_high)
+    base_points = r_points + e_points
+    renal_total_min = base_points + l_range[0] + (n_points if n_points is not None else n_low)
+    renal_total_max = base_points + l_range[1] + (n_points if n_points is not None else n_high)
     renal_total_estimate = (
-        base_points + (n_points if n_points is not None else n_estimate)
+        base_points + l_points + (n_points if n_points is not None else n_estimate)
         if (n_points is not None or n_estimate is not None)
         else None
     )
@@ -688,7 +699,8 @@ def nephrometry(unit: RenalUnit, distances: dict[str, Any]) -> dict[str, Any]:
             "N_gap_mm": n_gap,
             "total_estimate": renal_total_estimate,
             "A": a_letter,
-            "L": l_points,
+            "L": l_points,  # estimate; see L_range
+            "L_range": l_range,
             "hilar": hilar,
             "total_min": renal_total_min,
             "total_max": renal_total_max,
@@ -995,9 +1007,12 @@ def arterial_territories(unit: RenalUnit, depth: int = 1) -> dict[str, Any] | No
         "branches": branches,
         "feeding_branches": [branch["name"] for branch in feeding],
         "main_clamp_ischemic_ml": parenchyma_total,
-        "selective_clamp_ischemic_ml": selective_ml,
+        # Withheld (None) when the tree looks incomplete, also in JSON (review finding).
+        "selective_clamp_ischemic_ml": selective_ml if reliable else None,
         "selective_clamp_ischemic_pct": (
-            100.0 * selective_ml / parenchyma_total if parenchyma_total else 0.0
+            (100.0 * selective_ml / parenchyma_total if parenchyma_total else 0.0)
+            if reliable
+            else None
         ),
         "map": territory_map,
         "centerlines": {
@@ -1077,8 +1092,11 @@ def assemble_plan(geometry: dict[str, Any], margin_mm: float) -> dict[str, Any]:
             for name, item in geometry["distances"].items()
         },
     }
+    centroid = np.array(ndi.center_of_mass(unit.tumor))
     summary = {
         "tumor_index": unit.tumor_index,
+        # World position (RAS mm): independent of the grid the plan was computed on.
+        "tumor_center_mm": unit.world(centroid)[0].tolist(),
         "side": unit.side,
         "working_spacing_mm": list(unit.spacing),
         "sinus_source": unit.sinus_source,

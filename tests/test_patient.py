@@ -384,3 +384,29 @@ def test_inbox_item_replaced_under_same_name_is_not_deleted(tmp_path: Path) -> N
     (untouched / "IM1").write_bytes(b"a")
     record_inbox_source(raw, untouched)
     assert consume_inbox_source(raw, inbox) is True and not untouched.exists()
+
+
+def test_inbox_change_during_import_aborts_without_deleting(tmp_path: Path, monkeypatch) -> None:
+    """Regression (third review): study replaced while being copied."""
+
+    import renal_explorer.patient_ui as patient_ui
+
+    monkeypatch.setenv("RENAL_PATIENT_ROOT", str(tmp_path / "store"))
+    store = PatientStore(tmp_path / "store")
+    case = store.create_case()
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    study = inbox / "study"
+    study.mkdir()
+    (study / "IM1").write_bytes(b"study A")
+    real_copytree = patient_ui.shutil.copytree
+
+    def copy_then_replace(source, target, **kwargs):
+        result = real_copytree(source, target, **kwargs)
+        (study / "IM1").write_bytes(b"study B, different and longer")
+        return result
+
+    monkeypatch.setattr(patient_ui.shutil, "copytree", copy_then_replace)
+    assert patient_ui._ingest(case, study, study) is False
+    assert case.status()["state"] == "failed"
+    assert study.exists() and not case.raw_dir.exists()

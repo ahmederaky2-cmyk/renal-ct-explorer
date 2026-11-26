@@ -112,20 +112,30 @@ def _ingest(case, source: Path, inbox_source: Path | None = None) -> bool:
         list_series,
         record_inbox_source,
         safe_extract_zip,
+        source_fingerprint,
         write_series_index,
     )
 
+    before = source_fingerprint(inbox_source) if inbox_source is not None else None
     if source.is_dir():
         shutil.copytree(source, case.raw_dir, dirs_exist_ok=True)
     else:
         safe_extract_zip(source, case.raw_dir)
+    if inbox_source is not None and source_fingerprint(inbox_source) != before:
+        # Replaced or modified while being copied: what was staged may not be what is
+        # there now. Import nothing and delete nothing (review finding).
+        case.discard_raw()
+        case.update_status(
+            state="failed", error="The inbox item changed during import; nothing was deleted."
+        )
+        return False
     series = list_series(case.raw_dir)
     if not series:
         case.discard_raw()
         case.update_status(state="failed", error="No CT series with ≥20 slices found.")
         return False
     if inbox_source is not None:
-        record_inbox_source(case.raw_dir, inbox_source)
+        record_inbox_source(case.raw_dir, inbox_source, before)
     case.write_request({"series": write_series_index(case.raw_dir, series)})
     case.update_status(step="Choose series and phases")
     return True
