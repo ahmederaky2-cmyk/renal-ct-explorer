@@ -54,6 +54,15 @@ case ID, source CT SHA-256, dimensions, affine, labels, model source, and resear
 are checked by Streamlit before the artery/vein overlay is accepted. Imported predictions are
 kept separate from dataset annotations in measurements and exports.
 
+## Demo resolution on the free server
+
+The **Online demo** reads each scan at about 1.5 mm (`RENAL_DEMO_SPACING_MM`, `0` turns this
+off). Decimation happens while the file is read, so the full-resolution volume is never held
+in memory, and a banner says that measurements are approximate. Imported BA-Net predictions
+are verified against the full-resolution geometry and then reduced exactly like the CT.
+**Patient mode and server datasets always load at full resolution**, as do the validation
+scripts.
+
 ## Validate and train online first (no patient data)
 
 - `notebooks/kaggle_validation.ipynb` runs the automatic pipeline on public KiTS23 cases (free

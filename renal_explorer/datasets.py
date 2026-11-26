@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import nibabel as nib
 import numpy as np
@@ -43,8 +44,24 @@ class DatasetAdapter:
     def list_cases(self, root: Path) -> list[CaseFiles]:
         raise NotImplementedError
 
-    def load_case(self, files: CaseFiles) -> VolumeCase:
-        image_nii = nib.as_closest_canonical(nib.load(str(files.image_path)))
+    def load_case(self, files: CaseFiles, target_spacing_mm: float | None = None) -> VolumeCase:
+        """Load in canonical RAS. ``target_spacing_mm`` (demo only) decimates while reading;
+        the default is always full resolution."""
+
+        from .resolution import decimation_strides, full_canonical_geometry, read_reduced
+
+        raw_image = nib.load(str(files.image_path))
+        strides = decimation_strides(raw_image.header.get_zooms()[:3], target_spacing_mm)
+        resolution: dict[str, Any] = {"reduced": strides != (1, 1, 1), "strides": list(strides)}
+        if resolution["reduced"]:
+            full = full_canonical_geometry(raw_image)
+            resolution.update(
+                full_shape=list(full["shape"]),
+                full_affine=np.asarray(full["affine"]).tolist(),
+                orientation=full["orientation"],
+                full_spacing_mm=[float(value) for value in raw_image.header.get_zooms()[:3]],
+            )
+        image_nii = nib.as_closest_canonical(read_reduced(raw_image, strides))
         image = image_nii.get_fdata(dtype=np.float32)
         if image.ndim != 3:
             raise DatasetError(f"Expected a 3D image, got shape {image.shape}.")
@@ -54,7 +71,9 @@ class DatasetAdapter:
         segmentation = None
         source_labels: tuple[int, ...] = ()
         if files.segmentation_path is not None:
-            seg_nii = nib.as_closest_canonical(nib.load(str(files.segmentation_path)))
+            seg_nii = nib.as_closest_canonical(
+                read_reduced(nib.load(str(files.segmentation_path)), strides)
+            )
             if seg_nii.shape != image_nii.shape:
                 raise DatasetError(
                     f"Image and segmentation shapes differ: {image_nii.shape} vs {seg_nii.shape}."
@@ -79,6 +98,7 @@ class DatasetAdapter:
                 "segmentation_file": (
                     files.segmentation_path.name if files.segmentation_path else None
                 ),
+                "resolution": resolution,
             },
         )
 

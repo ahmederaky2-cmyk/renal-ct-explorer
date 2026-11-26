@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -34,6 +35,7 @@ from renal_explorer.patient_ui import (  # noqa: E402
     select_patient_case,
 )
 from renal_explorer.plan_ui import render_plan_tab  # noqa: E402
+from renal_explorer.resolution import demo_target_spacing, reduce_canonical_like  # noqa: E402
 from renal_explorer.prediction_packages import (  # noqa: E402
     PredictionPackageError,
     load_banet_prediction_package,
@@ -128,6 +130,7 @@ def load_case_bundle(
     segmentation_path: str,
     image_signature: tuple[int, int],
     segmentation_signature: tuple[int, int] | None,
+    target_spacing_mm: float | None = None,
 ):
     del image_signature, segmentation_signature
     adapter = get_adapter(dataset_key)
@@ -136,7 +139,7 @@ def load_case_bundle(
         image_path=Path(image_path),
         segmentation_path=Path(segmentation_path) if segmentation_path else None,
     )
-    case = adapter.load_case(files)
+    case = adapter.load_case(files, target_spacing_mm)
     return case, analyze_case(case)
 
 
@@ -494,10 +497,22 @@ def main() -> None:
                 segmentation_path,
                 file_signature(image_path),
                 file_signature(segmentation_path),
+                demo_target_spacing(access_mode, PATIENT_MODE),
             )
     except (DatasetError, OSError, ValueError) as exc:
         st.error(f"The case could not be loaded: {exc}")
         st.stop()
+
+    resolution = case.metadata.get("resolution", {})
+    if resolution.get("reduced"):
+        st.warning(
+            f"Demo resolution: this scan was reduced to about "
+            f"{', '.join(f'{value:.1f}' for value in case.spacing)} mm (from "
+            f"{', '.join(f'{value:.2f}' for value in resolution['full_spacing_mm'])} mm) to "
+            "fit the free server. Volumes, distances and scores are approximate; small "
+            "tumours and thin vessels lose detail. Planning on a private server or Mac "
+            "always uses full resolution."
+        )
 
     source_available_labels: list[CanonicalLabel] = []
     if case.segmentation is not None:
@@ -539,14 +554,29 @@ def main() -> None:
                         raise PredictionPackageError("The selected CT file is unavailable.")
                     with st.spinner("Checking prediction identity and geometry…"):
                         image_digest = cached_file_sha256(image_path, image_signature)
+                        # Verify against the full-resolution CT geometry, then (demo only)
+                        # reduce the prediction exactly as the CT was reduced.
+                        if resolution.get("reduced"):
+                            expected_shape = tuple(int(v) for v in resolution["full_shape"])
+                            expected_affine = np.asarray(resolution["full_affine"], dtype=float)
+                        else:
+                            expected_shape = tuple(int(value) for value in case.image.shape)
+                            expected_affine = case.affine
                         imported_prediction = cached_prediction_package(
                             package_digest,
                             case_id,
-                            tuple(int(value) for value in case.image.shape),
-                            tuple(float(value) for value in case.affine.ravel()),
+                            expected_shape,
+                            tuple(float(value) for value in expected_affine.ravel()),
                             image_digest,
                             prediction_payload,
                         )
+                        if resolution.get("reduced"):
+                            imported_prediction = dataclasses.replace(
+                                imported_prediction,
+                                segmentation=reduce_canonical_like(
+                                    imported_prediction.segmentation, resolution
+                                ),
+                            )
                     provenance = imported_prediction.provenance
                     st.success(
                         "Verified BA-Net prediction · "
