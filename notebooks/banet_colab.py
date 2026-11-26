@@ -6,6 +6,7 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -345,8 +346,17 @@ def build_prediction_package(
         "research_only": True,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
-    with ZipFile(output, "w") as archive:
-        archive.write(prediction, "vessels.nii.gz", compress_type=ZIP_STORED)
+    # Store labels as uint8 (BA-Net may write float32): 4x smaller and cheap to import.
+    native_nii = nib.load(str(prediction))
+    compact = nib.Nifti1Image(
+        np.rint(np.asanyarray(native_nii.dataobj)).astype(np.uint8), native_nii.affine
+    )
+    compact.set_data_dtype(np.uint8)
+    staging = tempfile.TemporaryDirectory(prefix="banet-package-")
+    compact_path = Path(staging.name) / "vessels.nii.gz"  # intermediate, never left behind
+    nib.save(compact, str(compact_path))
+    with staging, ZipFile(output, "w") as archive:
+        archive.write(compact_path, "vessels.nii.gz", compress_type=ZIP_STORED)
         archive.writestr(
             "provenance.json",
             json.dumps(provenance, indent=2),

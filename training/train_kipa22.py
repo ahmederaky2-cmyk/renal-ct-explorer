@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +55,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--artery-dice-gate", type=float, default=0.70)
     parser.add_argument("--vein-dice-gate", type=float, default=0.65)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue from <output>/last_state.pt (for multi-session Kaggle/Colab training).",
+    )
+    parser.add_argument(
+        "--time-limit-hours",
+        type=float,
+        default=0.0,
+        help="Save and exit with code 75 before this wall-clock budget runs out (0 = no limit).",
+    )
     return parser.parse_args()
 
 
@@ -381,8 +395,47 @@ def main() -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
     best_vessel_dice = -1.0
     checkpoint = args.output / "best_model.pt"
+    state_path = args.output / "last_state.pt"
+    start_epoch = 1
+    if args.resume and state_path.is_file():
+        state = torch.load(state_path, map_location=device, weights_only=False)
+        if state.get("fold") != args.fold or state.get("epochs") != args.epochs:
+            raise SystemExit("last_state.pt belongs to a different fold/epoch setting.")
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        scaler.load_state_dict(state["scaler"])
+        best_vessel_dice = state["best_vessel_dice"]
+        start_epoch = state["epoch"] + 1
+        random.setstate(state["python_rng"])
+        np.random.set_state(state["numpy_rng"])
+        torch.set_rng_state(state["torch_rng"])
+        print(json.dumps({"resumed_from_epoch": state["epoch"]}), flush=True)
 
-    for epoch in range(1, args.epochs + 1):
+    def save_state(epoch: int) -> None:
+        temporary = state_path.with_suffix(".tmp")
+        torch.save(
+            {
+                "epoch": epoch,
+                "fold": args.fold,
+                "epochs": args.epochs,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
+                "best_vessel_dice": best_vessel_dice,
+                "python_rng": random.getstate(),
+                "numpy_rng": np.random.get_state(),
+                "torch_rng": torch.get_rng_state(),
+            },
+            temporary,
+        )
+        os.replace(temporary, state_path)
+
+    session_start = time.monotonic()
+    epoch_seconds: list[float] = []
+    for epoch in range(start_epoch, args.epochs + 1):
+        epoch_start = time.monotonic()
         model.train()
         losses = []
         for batch in train_loader:
@@ -422,6 +475,22 @@ def main() -> None:
                 best_vessel_dice = metrics["mean_vessel_dice"]
                 torch.save(model.state_dict(), checkpoint)
 
+        save_state(epoch)
+        epoch_seconds.append(time.monotonic() - epoch_start)
+        if args.time_limit_hours > 0 and epoch < args.epochs:
+            elapsed = time.monotonic() - session_start
+            next_epoch = 1.5 * max(epoch_seconds[-5:])
+            if elapsed + next_epoch > args.time_limit_hours * 3600:
+                print(
+                    json.dumps(
+                        {"status": "paused", "epoch": epoch, "resume_with": "--resume"}
+                    ),
+                    flush=True,
+                )
+                sys.exit(75)
+
+    if not checkpoint.is_file():
+        raise SystemExit("No validated checkpoint was written; increase --epochs.")
     model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
     final_metrics = validation_dice(model, validation_loader, device)
     export_onnx(model, args.output / "model.onnx", device)

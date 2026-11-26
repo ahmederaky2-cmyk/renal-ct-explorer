@@ -30,7 +30,8 @@ This is research software. It is not a medical device and must not be used for d
 - Keeps CT volumes in a shared server cache rather than Streamlit session state.
 - Exports JSON and CSV through browser downloads.
 - Provides a container configuration for online deployment.
-- Provides an on-demand, three-case KiTS23 catalogue for free Streamlit hosting.
+- Provides an on-demand KiTS23 catalogue for free Streamlit hosting (three examples plus the
+  40-case blind scoring set); only the selected case is downloaded.
 - Limits the in-memory case cache to one entry for free-tier stability.
 
 The **Interactive 3D** tab is generated on demand. True renal artery and vein surfaces are
@@ -52,6 +53,78 @@ only one BA-Net fold from the 3.7 GB Zenodo archive. The notebook exports a comp
 case ID, source CT SHA-256, dimensions, affine, labels, model source, and research-only status
 are checked by Streamlit before the artery/vein overlay is accepted. Imported predictions are
 kept separate from dataset annotations in measurements and exports.
+
+## Demo resolution on the free server
+
+The **Online demo** reads each scan at about 1.5 mm (`RENAL_DEMO_SPACING_MM`, `0` turns this
+off). Each file is sampled on the same canonical grid while it is read, so the full-resolution
+float volume is never built; nibabel may still read much of the compressed file. On KiTS23
+case_00001 the review measured a peak of 0.61 GiB in demo mode against 2.9 GiB at full
+resolution. Plans, PDFs, JSON and STL exports made at demo resolution are marked as such.
+Imported BA-Net predictions are verified against the full-resolution geometry and then
+reduced like the CT; that verification still briefly needs memory for the full-size labels.
+**Patient mode and server datasets always load at full resolution**, as do the validation
+scripts.
+
+## Validate and train online first (no patient data)
+
+- `notebooks/kaggle_validation.ipynb` runs the automatic pipeline on public KiTS23 cases (free
+  Kaggle/Colab GPU) and reports segmentation accuracy (renal-mass and tumour Dice, lesion
+  detection by size) and **plan agreement**: the planner on expert labels vs on automatic
+  labels. KiTS23 was part of AbdomenAtlasNet's training data, so its tumour scores are
+  optimistic; the notebook can also run a held-out KiPA22 check.
+- Blind R.E.N.A.L. scoring: score the 40 cases in `validation/scoring_cases.txt` yourself
+  (they are also in the online demo's case list), export the sheet as CSV, and run
+  `validation/compare_scores.py`. It reports agreement (exact, weighted κ, mean difference)
+  between you and the planner on expert labels (the algorithm) and on automatic labels
+  (the whole pipeline).
+- `notebooks/kaggle_train_kipa22_vessels.ipynb` trains the renal artery/vein model on private
+  KiPA22 data across several sessions (`--resume`, `--time-limit-hours`) and exports the
+  validated ONNX model that the planner loads for arterial territories.
+
+## Private patient workflow (Mac)
+
+With `RENAL_PATIENT_MODE=1` the app gains a **Patient cases** mode: upload a DICOM ZIP (or drop
+it in an inbox folder), confirm which series is which phase, and a background job converts
+the series, segments them automatically, and produces a planning case. Steps:
+TotalSegmentator (MLX on Apple Silicon or PyTorch) for kidneys, great vessels and nearby
+organs; AbdomenAtlasNet-Tumors (nnU-Net v2, CC BY-NC 4.0) for kidney tumours; rigid
+registration of arterial and excretory phases; collecting system from the excretory phase;
+renal artery/vein from a validated KiPA22 model when installed. Labels can be corrected in
+3D Slicer and uploaded again. Raw DICOM is deleted after conversion, and cases are
+pseudonymised and purged automatically.
+
+Setup, remote access (Cloudflare Tunnel + Access or Tailscale), data protection notes and
+settings: [`docs/mac-deployment.md`](docs/mac-deployment.md).
+
+## Surgical plan tab (research prototype)
+
+The **Surgical plan** tab turns the labelmaps into a partial nephrectomy planning summary for
+one selected tumour. Everything is computed in physical millimetres on a crop around that
+tumour's kidney (`renal_explorer/planning.py`).
+
+| Output | How it is computed |
+|---|---|
+| R.E.N.A.L. (R, E, N, A, L, h) | Max diameter from the tumour hull; exophytic fraction outside a 15 mm Euclidean closing of the parenchyma; nearness to the collecting system label or, if absent, an image-derived renal sinus proxy; anterior/posterior and polar lines along the kidney's own principal axes; *h* only when the tumour touches artery/vein outside the parenchyma |
+| PADUA | Same geometry; items that need missing labels (e.g. collecting system) are shown as `?` and the score is reported as a range |
+| Distances | Shortest tumour-surface gap to sinus, collecting system, renal artery/vein, aorta and IVC, drawn as lines in 3D |
+| Contact surface | Area of the tumour surface touching parenchyma (marching-cubes mesh) |
+| Resection simulation | Margin slider (0 = enucleation) → parenchyma removed, ipsilateral and total parenchyma kept, structures inside or within 2 mm of the margin |
+| Arterial territories | When renal arteries are labelled (KiPA22) or imported (BA-Net): centreline tree, significant bifurcations that reach the kidney, nearest-branch territories, tumour-feeding branches and ischaemic volume for selective vs main-artery clamping |
+| Exports | PDF plan report, JSON plan data, STL surfaces in shared RAS millimetre coordinates for 3D printing or AR |
+
+Known limitations, stated in the interface as well:
+
+- Scores are unvalidated automated approximations; they need comparison against expert scoring
+  before any claim of agreement.
+- Without a collecting system label, N and the PADUA collecting-system item use a renal sinus
+  proxy (non-parenchymal fat/urine inside the renal envelope).
+- Territories are a nearest-branch (Voronoi) approximation, not a perfusion study.
+- Preserved volume is not a prediction of postoperative eGFR.
+
+On a 512 × 512 × 420 synthetic CT the plan geometry is computed in about 3 seconds with
+roughly 600 MB of working memory on top of the loaded volume. Margin changes reuse the cached
+geometry. Phantom-based tests live in `tests/test_planning.py`.
 
 ## 3D quality architecture
 
@@ -223,7 +296,7 @@ Do not add any CT volumes to the Git repository. Streamlit downloads the selecte
 temporary server storage and reuses that file while the application instance remains alive.
 The download may repeat after Streamlit restarts or redeploys the app.
 
-The free deployment is intended as a public research demonstration. The three-case catalogue
+The free deployment is intended as a public research demonstration. The small case catalogue
 and one-case memory cache are deliberate safeguards. A full-dataset or multi-user production
 deployment needs persistent object storage and larger memory limits.
 

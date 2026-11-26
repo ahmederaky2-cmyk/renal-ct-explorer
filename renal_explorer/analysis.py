@@ -5,6 +5,7 @@ from typing import Any
 import numpy as np
 from scipy import ndimage as ndi
 
+from .anatomy import great_vessel_midline_x, kidney_sides, x_extent
 from .labels import LABEL_NAMES, CanonicalLabel
 from .models import VolumeCase
 
@@ -56,7 +57,6 @@ def component_measurements(
     structure = ndi.generate_binary_structure(rank=3, connectivity=2)
     components, component_count = ndi.label(mask, structure=structure)
     measurements: list[dict[str, Any]] = []
-    center_x = (case.image.shape[0] - 1) / 2.0
 
     for component_id in range(1, component_count + 1):
         component_mask = components == component_id
@@ -65,14 +65,14 @@ def component_measurements(
             continue
         centroid_voxel = np.asarray(ndi.center_of_mass(component_mask), dtype=float)
         centroid_world = voxel_to_world(case.affine, centroid_voxel)
-        # nib.as_closest_canonical produces RAS+ voxel axes; increasing axis 0 is rightward.
-        laterality = "Right" if centroid_voxel[0] >= center_x else "Left"
+        extent = x_extent(component_mask, case.affine)
         measurements.append(
             {
                 "component": int(component_id),
-                "laterality": laterality,
+                "laterality": "Unknown",  # set anatomically in analyze_case
                 "centroid_voxel": [float(value) for value in centroid_voxel],
                 "centroid_world_mm": [float(value) for value in centroid_world],
+                "x_extent_world_mm": list(extent),
                 **stats,
             }
         )
@@ -96,6 +96,20 @@ def analyze_case(case: VolumeCase) -> dict[str, Any]:
 
     kidneys = component_measurements(case, segmentation == int(CanonicalLabel.KIDNEY), 0.1)
     tumors = component_measurements(case, segmentation == int(CanonicalLabel.TUMOR), 0.01)
+    sides = kidney_sides(
+        [
+            {
+                "x": kidney["centroid_world_mm"][0],
+                "x_min": kidney["x_extent_world_mm"][0],
+                "x_max": kidney["x_extent_world_mm"][1],
+                "volume": kidney["volume_ml"],
+            }
+            for kidney in kidneys
+        ],
+        great_vessel_midline_x(segmentation, case.affine),
+    )
+    for kidney, side in zip(kidneys, sides):  # noqa: B905
+        kidney["laterality"] = side
 
     for tumor in tumors:
         tumor_world = np.asarray(tumor["centroid_world_mm"])
@@ -108,6 +122,7 @@ def analyze_case(case: VolumeCase) -> dict[str, Any]:
             )
             distance = np.linalg.norm(tumor_world - np.asarray(nearest["centroid_world_mm"]))
             tumor["nearest_kidney"] = nearest["laterality"]
+            tumor["laterality"] = nearest["laterality"]
             tumor["kidney_centroid_distance_mm"] = float(distance)
 
     return {

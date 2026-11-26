@@ -18,6 +18,15 @@ class CanonicalLabel(IntEnum):
     RENAL_VEIN = 5
     AORTA = 6
     IVC = 7
+    COLLECTING_SYSTEM = 8
+    # Context organs for approach planning (from TotalSegmentator on patient cases).
+    LIVER = 9
+    SPLEEN = 10
+    PANCREAS = 11
+    DUODENUM = 12
+    COLON = 13
+    ADRENAL = 14
+    PSOAS = 15
 
 
 LABEL_NAMES = {
@@ -28,6 +37,14 @@ LABEL_NAMES = {
     CanonicalLabel.RENAL_VEIN: "Renal vein",
     CanonicalLabel.AORTA: "Aorta",
     CanonicalLabel.IVC: "Inferior vena cava",
+    CanonicalLabel.COLLECTING_SYSTEM: "Collecting system",
+    CanonicalLabel.LIVER: "Liver",
+    CanonicalLabel.SPLEEN: "Spleen",
+    CanonicalLabel.PANCREAS: "Pancreas",
+    CanonicalLabel.DUODENUM: "Duodenum",
+    CanonicalLabel.COLON: "Colon",
+    CanonicalLabel.ADRENAL: "Adrenal gland",
+    CanonicalLabel.PSOAS: "Psoas",
 }
 
 
@@ -39,4 +56,27 @@ LABEL_COLORS = {
     CanonicalLabel.RENAL_VEIN: (75, 115, 255),
     CanonicalLabel.AORTA: (225, 55, 95),
     CanonicalLabel.IVC: (85, 165, 255),
+    CanonicalLabel.COLLECTING_SYSTEM: (250, 235, 120),
+    CanonicalLabel.LIVER: (150, 75, 50),
+    CanonicalLabel.SPLEEN: (160, 90, 200),
+    CanonicalLabel.PANCREAS: (240, 200, 160),
+    CanonicalLabel.DUODENUM: (255, 170, 200),
+    CanonicalLabel.COLON: (200, 160, 90),
+    CanonicalLabel.ADRENAL: (255, 120, 0),
+    CanonicalLabel.PSOAS: (190, 70, 70),
 }
+
+
+RENAL_LABELS = frozenset(
+    {
+        CanonicalLabel.KIDNEY,
+        CanonicalLabel.TUMOR,
+        CanonicalLabel.CYST,
+        CanonicalLabel.RENAL_ARTERY,
+        CanonicalLabel.RENAL_VEIN,
+        CanonicalLabel.AORTA,
+        CanonicalLabel.IVC,
+        CanonicalLabel.COLLECTING_SYSTEM,
+    }
+)
+"""Structures shown by default; context organs are opt-in to keep 3D views light."""

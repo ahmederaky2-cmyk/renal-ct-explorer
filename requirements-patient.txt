@@ -1,0 +1,12 @@
+# Private patient workflow (planning Mac / workstation). Not needed for the public demo.
+-r requirements.txt
+SimpleITK>=2.3
+huggingface_hub>=0.24
+pytest>=8.0
+# PyTorch TotalSegmentator: label table, kidney_cysts subtask, fallback backend.
+TotalSegmentator>=2.4
+# AbdomenAtlasNet-Tumors runs with nnU-Net v2 (PyTorch, MPS on Apple Silicon).
+nnunetv2>=2.5
+# Native Apple Silicon TotalSegmentator (Metal); skipped elsewhere.
+# Pinned: 0.4.x removed `segment`, which the pipeline calls (falls back to PyTorch if absent).
+totalsegmentator-mlx>=0.1.6,<0.2; sys_platform == "darwin" and platform_machine == "arm64"

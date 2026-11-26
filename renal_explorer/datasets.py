@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import nibabel as nib
 import numpy as np
@@ -43,24 +44,57 @@ class DatasetAdapter:
     def list_cases(self, root: Path) -> list[CaseFiles]:
         raise NotImplementedError
 
-    def load_case(self, files: CaseFiles) -> VolumeCase:
-        image_nii = nib.as_closest_canonical(nib.load(str(files.image_path)))
+    # Only public demo datasets may be read at reduced resolution.
+    allows_reduction = False
+
+    def load_case(self, files: CaseFiles, target_spacing_mm: float | None = None) -> VolumeCase:
+        """Load in canonical RAS. ``target_spacing_mm`` (public demo only) samples the
+        canonical grid while reading; the default is always full resolution."""
+
+        from .resolution import decimation_strides, full_canonical_geometry, read_reduced
+
+        if target_spacing_mm and not self.allows_reduction:
+            raise DatasetError(f"{self.info.name} is always loaded at full resolution.")
+        raw_image = nib.load(str(files.image_path))
+        raw_segmentation = (
+            nib.load(str(files.segmentation_path)) if files.segmentation_path is not None else None
+        )
+        if len(raw_image.shape) != 3:
+            raise DatasetError(f"Expected a 3D image, got shape {raw_image.shape}.")
+        full = full_canonical_geometry(raw_image)
+        # Check both full-resolution headers before reading any data, so reduction can
+        # neither hide a mismatch nor reject a valid pair stored in different orientations.
+        if raw_segmentation is not None:
+            label_geometry = full_canonical_geometry(raw_segmentation)
+            if label_geometry["shape"] != full["shape"]:
+                raise DatasetError(
+                    "Image and segmentation shapes differ: "
+                    f"{full['shape']} vs {label_geometry['shape']}."
+                )
+            if not np.allclose(full["affine"], label_geometry["affine"], atol=1e-3):
+                raise DatasetError("Image and segmentation affine matrices do not match.")
+
+        strides = decimation_strides(full["spacing"], target_spacing_mm)
+        resolution: dict[str, Any] = {"reduced": strides != (1, 1, 1), "strides": list(strides)}
+        if resolution["reduced"]:
+            resolution.update(
+                full_shape=list(full["shape"]),
+                full_affine=np.asarray(full["affine"]).tolist(),
+                full_spacing_mm=list(full["spacing"]),
+            )
+        image_nii = nib.as_closest_canonical(read_reduced(raw_image, strides))
         image = image_nii.get_fdata(dtype=np.float32)
-        if image.ndim != 3:
-            raise DatasetError(f"Expected a 3D image, got shape {image.shape}.")
         if not np.all(np.isfinite(image)):
             raise DatasetError("The image contains NaN or infinite values.")
 
         segmentation = None
         source_labels: tuple[int, ...] = ()
-        if files.segmentation_path is not None:
-            seg_nii = nib.as_closest_canonical(nib.load(str(files.segmentation_path)))
-            if seg_nii.shape != image_nii.shape:
-                raise DatasetError(
-                    f"Image and segmentation shapes differ: {image_nii.shape} vs {seg_nii.shape}."
-                )
-            if not np.allclose(image_nii.affine, seg_nii.affine, atol=1e-3):
-                raise DatasetError("Image and segmentation affine matrices do not match.")
+        if raw_segmentation is not None:
+            seg_nii = nib.as_closest_canonical(read_reduced(raw_segmentation, strides))
+            if seg_nii.shape != image_nii.shape or not np.allclose(
+                image_nii.affine, seg_nii.affine, atol=1e-3
+            ):
+                raise DatasetError("Image and segmentation grids differ after loading.")
             source = np.asanyarray(seg_nii.dataobj).astype(np.int16, copy=False)
             source_labels = tuple(int(value) for value in np.unique(source))
             segmentation = remap_labels(source, self.label_mapping)
@@ -79,6 +113,7 @@ class DatasetAdapter:
                 "segmentation_file": (
                     files.segmentation_path.name if files.segmentation_path else None
                 ),
+                "resolution": resolution,
             },
         )
 
@@ -142,6 +177,7 @@ def _first_directory(root: Path, names: Iterable[str]) -> Path | None:
 
 
 class KiTS23Adapter(CaseDirectoryAdapter):
+    allows_reduction = True  # the public online demo
     info = DatasetInfo(
         key="kits23",
         name="KiTS23",
@@ -241,6 +277,30 @@ class FLARE22Adapter(SplitDirectoryAdapter):
     }
 
 
+class PatientCasesAdapter(CaseDirectoryAdapter):
+    """Cases produced by ``renal_explorer.patient`` (labels already canonical)."""
+
+    info = DatasetInfo(
+        key="patient",
+        name="Patient cases (private)",
+        source_url="https://github.com/ahmederaky2-cmyk/renal-ct-explorer",
+        license_name="Institutional data — do not redistribute",
+        description=(
+            "Pseudonymised cases uploaded as DICOM and segmented automatically on this server. "
+            "Automatic labels require review before use."
+        ),
+        expected_layout="PN-xxxxxxxx/imaging.nii.gz + segmentation.nii.gz",
+    )
+    label_mapping = {int(label): label for label in CanonicalLabel if int(label) != 0}
+
+    def list_cases(self, root: Path) -> list[CaseFiles]:
+        return [
+            case
+            for case in super().list_cases(root)
+            if case.case_id.startswith("PN-") and case.segmentation_path is not None
+        ]
+
+
 DATASETS: dict[str, type[DatasetAdapter]] = {
     adapter.info.key: adapter
     for adapter in (
@@ -250,6 +310,7 @@ DATASETS: dict[str, type[DatasetAdapter]] = {
         AbdomenAtlasAdapter,
         AMOS22Adapter,
         FLARE22Adapter,
+        PatientCasesAdapter,
     )
 }
 

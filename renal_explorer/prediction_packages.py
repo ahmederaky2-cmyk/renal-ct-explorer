@@ -42,14 +42,72 @@ def _bounded_read(handle, maximum_bytes: int) -> bytes:
     return output.getvalue()
 
 
-def _read_gzip_nifti(payload: bytes) -> nib.Nifti1Image:
-    try:
-        with gzip.GzipFile(fileobj=BytesIO(payload), mode="rb") as handle:
-            uncompressed = _bounded_read(handle, MAX_NIFTI_BYTES)
-        image = nib.Nifti1Image.from_bytes(uncompressed)
-    except (OSError, ValueError) as exc:
-        raise PredictionPackageError(f"The vessel NIfTI file is unreadable: {exc}") from exc
-    return nib.as_closest_canonical(image)
+LABEL_SLAB = 16
+
+
+def _read_label_volume(
+    payload: bytes, expected_shape: tuple[int, int, int], expected_affine: np.ndarray
+) -> np.ndarray:
+    """Validated BA-Net labels (0-4) as a canonical uint8 array, with bounded memory.
+
+    The gzip stream is decompressed to a temporary file, the geometry is checked from the
+    header alone, and the voxels are converted slab by slab. No full-size float copy is ever
+    built, whatever dtype the package stores (review finding: float32 packages peaked at
+    1.8 GiB when decompressed and reoriented in memory).
+    """
+
+    import tempfile
+    from pathlib import Path
+
+    from nibabel import orientations
+
+    from .resolution import full_canonical_geometry
+
+    with tempfile.TemporaryDirectory(prefix="renal-vessels-") as folder:
+        path = Path(folder) / "vessels.nii"
+        try:
+            with gzip.GzipFile(fileobj=BytesIO(payload), mode="rb") as source, open(
+                path, "wb"
+            ) as target:
+                total = 0
+                while block := source.read(8 * 1024 * 1024):
+                    total += len(block)
+                    if total > MAX_NIFTI_BYTES:
+                        raise PredictionPackageError(
+                            "Prediction package content exceeds its size limit."
+                        )
+                    target.write(block)
+            image = nib.load(str(path), mmap=False)
+        except (OSError, ValueError, EOFError) as exc:
+            raise PredictionPackageError(f"The vessel NIfTI file is unreadable: {exc}") from exc
+        if len(image.shape) != 3:
+            raise PredictionPackageError(f"Expected a 3D prediction, got {image.shape}.")
+        geometry = full_canonical_geometry(image)
+        if tuple(geometry["shape"]) != tuple(expected_shape):
+            raise PredictionPackageError(
+                "Prediction dimensions differ from the CT: "
+                f"{tuple(geometry['shape'])} vs {tuple(expected_shape)}."
+            )
+        if not np.allclose(geometry["affine"], expected_affine, atol=1e-3):
+            raise PredictionPackageError("Prediction and CT affine matrices do not match.")
+
+        native = np.empty(image.shape, dtype=np.uint8)
+        for start in range(0, image.shape[2], LABEL_SLAB):
+            slab = np.asanyarray(image.dataobj[:, :, start : start + LABEL_SLAB])
+            if not np.issubdtype(slab.dtype, np.integer) and (
+                not np.all(np.isfinite(slab)) or not np.array_equal(slab, np.rint(slab))
+            ):
+                raise PredictionPackageError("Prediction labels must be finite integer values.")
+            if slab.size and (slab.min() < 0 or slab.max() > 4):
+                found = np.unique(slab[(slab < 0) | (slab > 4)])
+                raise PredictionPackageError(
+                    "Prediction contains unexpected BA-Net labels: "
+                    f"{sorted(int(value) for value in found)}."
+                )
+            native[:, :, start : start + LABEL_SLAB] = slab
+            del slab
+        orientation = orientations.io_orientation(image.affine)
+        return np.ascontiguousarray(orientations.apply_orientation(native, orientation))
 
 
 def _validate_provenance(
@@ -157,26 +215,15 @@ def load_banet_prediction_package(
         expected_image_sha256,
     )
 
-    prediction_nii = _read_gzip_nifti(nifti_payload)
-    if prediction_nii.shape != expected_shape:
-        raise PredictionPackageError(
-            f"Prediction dimensions differ from the CT: {prediction_nii.shape} vs {expected_shape}."
-        )
-    if not np.allclose(prediction_nii.affine, expected_affine, atol=1e-3):
-        raise PredictionPackageError("Prediction and CT affine matrices do not match.")
-    source = np.asanyarray(prediction_nii.dataobj)
-    if not np.all(np.isfinite(source)) or not np.allclose(source, np.rint(source)):
-        raise PredictionPackageError("Prediction labels must be finite integer values.")
-    source = np.rint(source).astype(np.int16, copy=False)
-    unexpected = set(int(value) for value in np.unique(source)).difference({0, 1, 2, 3, 4})
-    if unexpected:
-        raise PredictionPackageError(
-            f"Prediction contains unexpected BA-Net labels: {sorted(unexpected)}."
-        )
-
-    canonical = np.zeros(expected_shape, dtype=np.uint8)
-    canonical[source == 1] = int(CanonicalLabel.RENAL_VEIN)
-    canonical[source == 3] = int(CanonicalLabel.RENAL_ARTERY)
+    source = _read_label_volume(
+        nifti_payload, tuple(expected_shape), np.asarray(expected_affine, dtype=float)
+    )
+    # BA-Net 1 = vein, 3 = artery; kidney (2) and tumour (4) come from the source labels.
+    lookup = np.zeros(256, dtype=np.uint8)
+    lookup[1] = int(CanonicalLabel.RENAL_VEIN)
+    lookup[3] = int(CanonicalLabel.RENAL_ARTERY)
+    canonical = lookup[source]
+    del source
     provenance = {
         **provenance,
         "artery_voxels": int(np.count_nonzero(canonical == CanonicalLabel.RENAL_ARTERY)),

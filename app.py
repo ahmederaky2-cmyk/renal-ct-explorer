@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -19,8 +20,22 @@ st.set_page_config(
 
 from renal_explorer.analysis import analyze_case, histogram_table  # noqa: E402
 from renal_explorer.datasets import DATASETS, DatasetError, get_adapter  # noqa: E402
-from renal_explorer.labels import LABEL_COLORS, LABEL_NAMES, CanonicalLabel  # noqa: E402
+from renal_explorer.identity import file_signature  # noqa: E402
+from renal_explorer.labels import (  # noqa: E402
+    LABEL_COLORS,
+    LABEL_NAMES,
+    RENAL_LABELS,
+    CanonicalLabel,
+)
 from renal_explorer.models import CaseFiles  # noqa: E402
+from renal_explorer.patient_ui import (  # noqa: E402
+    PATIENT_MODE,
+    render_correction_panel,
+    render_patient_workspace,
+    require_password,
+    select_patient_case,
+)
+from renal_explorer.plan_ui import render_plan_tab  # noqa: E402
 from renal_explorer.prediction_packages import (  # noqa: E402
     PredictionPackageError,
     load_banet_prediction_package,
@@ -35,6 +50,11 @@ from renal_explorer.rendering import (  # noqa: E402
     VIEW_AXES,
     legend_html,
     render_view,
+)
+from renal_explorer.resolution import (  # noqa: E402
+    demo_target_spacing,
+    grid_token,
+    reduce_canonical_like,
 )
 from renal_explorer.three_d import (  # noqa: E402
     candidate_vessel_mesh,
@@ -69,6 +89,7 @@ LABEL_OPACITY = {
     CanonicalLabel.RENAL_VEIN: 0.90,
     CanonicalLabel.AORTA: 0.65,
     CanonicalLabel.IVC: 0.65,
+    CanonicalLabel.COLLECTING_SYSTEM: 0.85,
 }
 
 
@@ -112,8 +133,9 @@ def load_case_bundle(
     case_id: str,
     image_path: str,
     segmentation_path: str,
-    image_signature: tuple[int, int],
-    segmentation_signature: tuple[int, int] | None,
+    image_signature: tuple[int, ...],
+    segmentation_signature: tuple[int, ...] | None,
+    target_spacing_mm: float | None = None,
 ):
     del image_signature, segmentation_signature
     adapter = get_adapter(dataset_key)
@@ -122,7 +144,7 @@ def load_case_bundle(
         image_path=Path(image_path),
         segmentation_path=Path(segmentation_path) if segmentation_path else None,
     )
-    case = adapter.load_case(files)
+    case = adapter.load_case(files, target_spacing_mm)
     return case, analyze_case(case)
 
 
@@ -145,7 +167,7 @@ def cached_label_surface(
 def cached_candidate_vessels(
     dataset_key: str,
     case_id: str,
-    image_signature: tuple[int, int],
+    image_signature: tuple[int, ...],
     segmentation_signature: str,
     sensitivity: str,
     detail: str,
@@ -180,7 +202,7 @@ def cached_vessel_model_bundle(
 def cached_ml_vessels(
     dataset_key: str,
     case_id: str,
-    image_signature: tuple[int, int],
+    image_signature: tuple[int, ...],
     segmentation_signature: str,
     model_sha256: str,
     _image: np.ndarray,
@@ -204,7 +226,7 @@ def cached_ml_vessels(
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
-def cached_file_sha256(path: str, signature: tuple[int, int]) -> str:
+def cached_file_sha256(path: str, signature: tuple[int, ...]) -> str:
     del signature
     return sha256_file(Path(path))
 
@@ -217,16 +239,26 @@ def cached_prediction_package(
     expected_affine_values: tuple[float, ...],
     expected_image_sha256: str,
     _payload: bytes,
+    reduce_strides: tuple[int, int, int] | None = None,
 ):
     del package_sha256
     affine = np.asarray(expected_affine_values, dtype=float).reshape(4, 4)
-    return load_banet_prediction_package(
+    prediction = load_banet_prediction_package(
         _payload,
         expected_case_id,
         expected_shape,
         affine,
         expected_image_sha256,
     )
+    if reduce_strides:
+        # Demo: verified on the full grid, then only the reduced array is kept in cache.
+        prediction = dataclasses.replace(
+            prediction,
+            segmentation=reduce_canonical_like(
+                prediction.segmentation, {"strides": reduce_strides}
+            ),
+        )
+    return prediction
 
 
 def build_3d_figure(
@@ -266,7 +298,7 @@ def build_3d_figure(
                 k=faces[:, 2],
                 name=LABEL_NAMES[label],
                 color=f"rgb({red},{green},{blue})",
-                opacity=LABEL_OPACITY[label],
+                opacity=LABEL_OPACITY.get(label, 0.35),
                 flatshading=False,
                 lighting={"ambient": 0.55, "diffuse": 0.75, "specular": 0.25},
                 hovertemplate=f"{LABEL_NAMES[label]}<extra></extra>",
@@ -313,13 +345,6 @@ def build_3d_figure(
         uirevision="renal-3d",
     )
     return figure
-
-
-def file_signature(path: str) -> tuple[int, int] | None:
-    if not path:
-        return None
-    stat = Path(path).stat()
-    return stat.st_size, stat.st_mtime_ns
 
 
 def root_default(dataset_key: str) -> str:
@@ -379,18 +404,37 @@ def render_missing_dataset(adapter, dataset_root: str) -> None:
 
 
 def main() -> None:
-    dataset_keys = list(DATASETS)
+    require_password()
+    dataset_keys = [key for key in DATASETS if key != "patient"]
     missing_server_dataset = False
+    patient_case_selected = False
+    access_modes = ("Online demo", "Server datasets") + (
+        ("Patient cases",) if PATIENT_MODE else ()
+    )
+    if PATIENT_MODE:
+        default_mode = 2
+    else:
+        default_mode = 1 if "RENAL_DATA_ROOT" in os.environ else 0
     with st.sidebar:
         st.title("Dataset")
         access_mode = st.radio(
             "Data access",
-            ("Online demo", "Server datasets"),
-            index=1 if "RENAL_DATA_ROOT" in os.environ else 0,
+            access_modes,
+            index=default_mode,
             help="Online demo retrieves only the selected public KiTS23 case.",
         )
 
-        if access_mode == "Online demo":
+        if access_mode == "Patient cases":
+            dataset_key = "patient"
+            adapter = get_adapter(dataset_key)
+            selection = select_patient_case()
+            if selection is None:
+                case_id = image_path = segmentation_path = ""
+                dataset_root = ""
+            else:
+                case_id, image_path, segmentation_path, dataset_root = selection
+                patient_case_selected = True
+        elif access_mode == "Online demo":
             dataset_key = "kits23"
             adapter = get_adapter(dataset_key)
             case_id = st.selectbox(
@@ -441,6 +485,13 @@ def main() -> None:
         st.caption(f"License: {adapter.info.license_name}")
         st.markdown(f"[Official source]({adapter.info.source_url})")
 
+    if access_mode == "Patient cases":
+        render_patient_workspace(expanded=not patient_case_selected)
+        if not patient_case_selected:
+            st.stop()
+        with st.sidebar:
+            render_correction_panel(case_id)
+
     if missing_server_dataset:
         render_missing_dataset(adapter, dataset_root)
         st.stop()
@@ -454,10 +505,22 @@ def main() -> None:
                 segmentation_path,
                 file_signature(image_path),
                 file_signature(segmentation_path),
+                demo_target_spacing(access_mode, PATIENT_MODE),
             )
     except (DatasetError, OSError, ValueError) as exc:
         st.error(f"The case could not be loaded: {exc}")
         st.stop()
+
+    resolution = case.metadata.get("resolution", {})
+    if resolution.get("reduced"):
+        st.warning(
+            f"Demo resolution: this scan was reduced to about "
+            f"{', '.join(f'{value:.1f}' for value in case.spacing)} mm (from "
+            f"{', '.join(f'{value:.2f}' for value in resolution['full_spacing_mm'])} mm) to "
+            "fit the free server. Volumes, distances and scores are approximate; small "
+            "tumours and thin vessels lose detail. Planning on a private server or Mac "
+            "always uses full resolution."
+        )
 
     source_available_labels: list[CanonicalLabel] = []
     if case.segmentation is not None:
@@ -499,13 +562,26 @@ def main() -> None:
                         raise PredictionPackageError("The selected CT file is unavailable.")
                     with st.spinner("Checking prediction identity and geometry…"):
                         image_digest = cached_file_sha256(image_path, image_signature)
+                        # Verify against the full-resolution CT geometry, then (demo only)
+                        # reduce the prediction exactly as the CT was reduced.
+                        if resolution.get("reduced"):
+                            expected_shape = tuple(int(v) for v in resolution["full_shape"])
+                            expected_affine = np.asarray(resolution["full_affine"], dtype=float)
+                        else:
+                            expected_shape = tuple(int(value) for value in case.image.shape)
+                            expected_affine = case.affine
                         imported_prediction = cached_prediction_package(
                             package_digest,
                             case_id,
-                            tuple(int(value) for value in case.image.shape),
-                            tuple(float(value) for value in case.affine.ravel()),
+                            expected_shape,
+                            tuple(float(value) for value in expected_affine.ravel()),
                             image_digest,
                             prediction_payload,
+                            (
+                                tuple(int(value) for value in resolution["strides"])
+                                if resolution.get("reduced")
+                                else None
+                            ),
                         )
                     provenance = imported_prediction.provenance
                     st.success(
@@ -535,9 +611,15 @@ def main() -> None:
             for label in CanonicalLabel
             if label != CanonicalLabel.BACKGROUND and int(label) in present
         ]
+    # Grid identity is part of every derived cache key: the same file loaded at demo and at
+    # full resolution must never share plans, meshes or slice positions (review finding).
+    # Grid and CT identity are part of every derived cache key: the same labels on another
+    # grid, or under a replaced CT (the sinus proxy reads HU), must never share results.
+    active_grid = grid_token(case.image.shape, case.affine, case.metadata.get("resolution"))
     segmentation_cache_token = (
         f"{file_signature(segmentation_path)}:"
-        f"{imported_prediction.package_sha256 if imported_prediction else 'source'}"
+        f"{imported_prediction.package_sha256 if imported_prediction else 'source'}:"
+        f"ct={file_signature(image_path)}:{active_grid}"
     )
 
     with st.sidebar:
@@ -570,7 +652,9 @@ def main() -> None:
             selected_names = st.multiselect(
                 "Structures",
                 [LABEL_NAMES[label] for label in available_labels],
-                default=[LABEL_NAMES[label] for label in available_labels],
+                default=[
+                    LABEL_NAMES[label] for label in available_labels if label in RENAL_LABELS
+                ],
             )
             visible_labels = [
                 label for label in available_labels if LABEL_NAMES[label] in selected_names
@@ -672,9 +756,18 @@ def main() -> None:
     if visible_labels and overlay_mode != "Off":
         st.markdown(legend_html(visible_labels), unsafe_allow_html=True)
 
-    tab_measurements, tab_3d, tab_histogram, tab_export, tab_source = st.tabs(
-        ["Measurements", "Interactive 3D", "HU histogram", "Export", "Source"]
+    tab_plan, tab_measurements, tab_3d, tab_histogram, tab_export, tab_source = st.tabs(
+        ["Surgical plan", "Measurements", "Interactive 3D", "HU histogram", "Export", "Source"]
     )
+    with tab_plan:
+        render_plan_tab(
+            adapter=adapter,
+            dataset_key=dataset_key,
+            case=case,
+            analysis=analysis,
+            imported_prediction=imported_prediction,
+            segmentation_token=segmentation_cache_token,
+        )
     with tab_measurements:
         if not regions:
             st.info("This case has no mapped segmentation file.")
@@ -865,9 +958,9 @@ def main() -> None:
                         if surface_segmentation is None:
                             continue
                         surface_signature = (
-                            f"prediction:{imported_prediction.package_sha256}"
+                            f"prediction:{imported_prediction.package_sha256}:{active_grid}"
                             if imported_vessel_label
-                            else f"source:{file_signature(segmentation_path)}"
+                            else f"source:{file_signature(segmentation_path)}:{active_grid}"
                         )
                         mesh = cached_label_surface(
                             dataset_key,
