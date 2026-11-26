@@ -30,7 +30,8 @@ This is research software. It is not a medical device and must not be used for d
 - Keeps CT volumes in a shared server cache rather than Streamlit session state.
 - Exports JSON and CSV through browser downloads.
 - Provides a container configuration for online deployment.
-- Provides an on-demand, three-case KiTS23 catalogue for free Streamlit hosting.
+- Provides an on-demand KiTS23 catalogue for free Streamlit hosting (three examples plus the
+  40-case blind scoring set); only the selected case is downloaded.
 - Limits the in-memory case cache to one entry for free-tier stability.
 
 The **Interactive 3D** tab is generated on demand. True renal artery and vein surfaces are
@@ -52,6 +53,22 @@ only one BA-Net fold from the 3.7 GB Zenodo archive. The notebook exports a comp
 case ID, source CT SHA-256, dimensions, affine, labels, model source, and research-only status
 are checked by Streamlit before the artery/vein overlay is accepted. Imported predictions are
 kept separate from dataset annotations in measurements and exports.
+
+## Validate and train online first (no patient data)
+
+- `notebooks/kaggle_validation.ipynb` runs the automatic pipeline on public KiTS23 cases (free
+  Kaggle/Colab GPU) and reports segmentation accuracy (renal-mass and tumour Dice, lesion
+  detection by size) and **plan agreement**: the planner on expert labels vs on automatic
+  labels. KiTS23 was part of AbdomenAtlasNet's training data, so its tumour scores are
+  optimistic; the notebook can also run a held-out KiPA22 check.
+- Blind R.E.N.A.L. scoring: score the 40 cases in `validation/scoring_cases.txt` yourself
+  (they are also in the online demo's case list), export the sheet as CSV, and run
+  `validation/compare_scores.py`. It reports agreement (exact, weighted κ, mean difference)
+  between you and the planner on expert labels (the algorithm) and on automatic labels
+  (the whole pipeline).
+- `notebooks/kaggle_train_kipa22_vessels.ipynb` trains the renal artery/vein model on private
+  KiPA22 data across several sessions (`--resume`, `--time-limit-hours`) and exports the
+  validated ONNX model that the planner loads for arterial territories.
 
 ## Private patient workflow (Mac)
 
@@ -267,7 +284,7 @@ Do not add any CT volumes to the Git repository. Streamlit downloads the selecte
 temporary server storage and reuses that file while the application instance remains alive.
 The download may repeat after Streamlit restarts or redeploys the app.
 
-The free deployment is intended as a public research demonstration. The three-case catalogue
+The free deployment is intended as a public research demonstration. The small case catalogue
 and one-case memory cache are deliberate safeguards. A full-dataset or multi-user production
 deployment needs persistent object storage and larger memory limits.
 

@@ -50,6 +50,57 @@ def from_ras(array: np.ndarray, affine: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(orient.apply_orientation(array, transform))
 
 
+def segment_main_phase(
+    image_path: Path,
+    work_dir: Path,
+    settings: PipelineSettings,
+    log,
+    step,
+    warn,
+    provenance: dict[str, Any],
+) -> dict[CanonicalLabel, np.ndarray]:
+    """TotalSegmentator + cyst subtask + tumour model on one NIfTI CT (no DICOM needed)."""
+
+    masks: dict[CanonicalLabel, np.ndarray] = {}
+    step("TotalSegmentator: kidneys, great vessels and nearby organs")
+    totalseg_labels, totalseg_info = run_totalsegmentator(image_path, settings, log)
+    provenance["totalsegmentator"] = totalseg_info
+    for name, mask in map_totalseg_labels(totalseg_labels, totalseg_class_map()).items():
+        masks[CanonicalLabel[name]] = mask
+    del totalseg_labels
+    if CanonicalLabel.KIDNEY not in masks:
+        raise PipelineError("No kidney was found on the main phase.")
+
+    step("Kidney cysts")
+    try:
+        cysts = run_kidney_cysts(image_path, settings, log)
+        if cysts is not None:
+            masks[CanonicalLabel.CYST] = masks.get(CanonicalLabel.CYST, False) | cysts
+            provenance["kidney_cysts"] = "TotalSegmentator kidney_cysts subtask"
+    except Exception as exc:  # noqa: BLE001 - optional step
+        warn(f"Kidney cyst subtask failed: {exc}")
+
+    step("Kidney tumours (AbdomenAtlasNet)")
+    try:
+        tumors = run_atlasnet_tumors(image_path, work_dir, settings, log)
+        if tumors is None:
+            warn(
+                "No automatic tumour model installed: outline the tumour (e.g. 3D Slicer) and "
+                "upload the corrected segmentation."
+            )
+        else:
+            tumor_mask, atlas_cysts, tumor_info = tumors
+            masks[CanonicalLabel.TUMOR] = tumor_mask
+            if atlas_cysts.any():
+                masks[CanonicalLabel.CYST] = masks.get(CanonicalLabel.CYST, False) | atlas_cysts
+            provenance["tumor_model"] = tumor_info
+            if not tumor_mask.any():
+                warn("The tumour model found no kidney tumour on this scan.")
+    except Exception as exc:  # noqa: BLE001
+        warn(f"Tumour model failed: {exc}")
+    return masks
+
+
 def run_case(case: PatientCase, settings: PipelineSettings | None = None) -> dict[str, Any]:
     import nibabel as nib
 
@@ -110,44 +161,9 @@ def run_case(case: PatientCase, settings: PipelineSettings | None = None) -> dic
     # 2. Segment the main phase.
     reference = nib.load(str(case.image_path))
     spacing = tuple(float(value) for value in reference.header.get_zooms()[:3])
-    masks: dict[CanonicalLabel, np.ndarray] = {}
-
-    step("TotalSegmentator: kidneys, great vessels and nearby organs")
-    totalseg_labels, totalseg_info = run_totalsegmentator(case.image_path, settings, log)
-    provenance["totalsegmentator"] = totalseg_info
-    for name, mask in map_totalseg_labels(totalseg_labels, totalseg_class_map()).items():
-        masks[CanonicalLabel[name]] = mask
-    del totalseg_labels
-    if CanonicalLabel.KIDNEY not in masks:
-        raise PipelineError("No kidney was found on the main phase.")
-
-    step("Kidney cysts")
-    try:
-        cysts = run_kidney_cysts(case.image_path, settings, log)
-        if cysts is not None:
-            masks[CanonicalLabel.CYST] = masks.get(CanonicalLabel.CYST, False) | cysts
-            provenance["kidney_cysts"] = "TotalSegmentator kidney_cysts subtask"
-    except Exception as exc:  # noqa: BLE001 - optional step
-        warn(f"Kidney cyst subtask failed: {exc}")
-
-    step("Kidney tumours (AbdomenAtlasNet)")
-    try:
-        tumors = run_atlasnet_tumors(case.image_path, case.path / "work", settings, log)
-        if tumors is None:
-            warn(
-                "No automatic tumour model installed: outline the tumour (e.g. 3D Slicer) and "
-                "upload the corrected segmentation."
-            )
-        else:
-            tumor_mask, atlas_cysts, tumor_info = tumors
-            masks[CanonicalLabel.TUMOR] = tumor_mask
-            if atlas_cysts.any():
-                masks[CanonicalLabel.CYST] = masks.get(CanonicalLabel.CYST, False) | atlas_cysts
-            provenance["tumor_model"] = tumor_info
-            if not tumor_mask.any():
-                warn("The tumour model found no kidney tumour on this scan.")
-    except Exception as exc:  # noqa: BLE001
-        warn(f"Tumour model failed: {exc}")
+    masks = segment_main_phase(
+        case.image_path, case.path / "work", settings, log, step, warn, provenance
+    )
 
     # 3. Register the other phases onto the main phase (renal region of interest).
     renal = masks[CanonicalLabel.KIDNEY] | masks.get(CanonicalLabel.TUMOR, False)
