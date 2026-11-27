@@ -46,17 +46,20 @@ jobs:
           streamlit run app.py --server.headless true --server.port 8501 > demo.log 2>&1 &
           sleep 15
           python scripts/visual/visual_check.py --url http://localhost:8501 --out shots \
-            --prefix demo_ --cases $CASES --mobile-case case_00015
+            --prefix demo_ --cases $CASES --mobile-case case_00015 || status=$?
           kill %1 || true
+          exit ${status:-0}
       - name: Full resolution (server dataset mode)
+        if: always()
         env:
           RENAL_DATA_ROOT: /tmp/kits
         run: |
           streamlit run app.py --server.headless true --server.port 8502 > full.log 2>&1 &
           sleep 15
           python scripts/visual/visual_check.py --url http://localhost:8502 --out shots \
-            --prefix full_ --cases $CASES
+            --prefix full_ --cases $CASES || status=$?
           kill %1 || true
+          exit ${status:-0}
       - name: Logs
         if: always()
         run: |
