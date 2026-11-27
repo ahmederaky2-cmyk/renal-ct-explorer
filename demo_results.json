@@ -1,0 +1,80 @@
+[
+  {
+    "case": "case_00015",
+    "files": [
+      "demo_case_00015_01_overview.png",
+      "demo_case_00015_02_plan.png",
+      "demo_case_00015_03_plan_3d.png",
+      "demo_case_00015_04_plan_3d_chart.png",
+      "demo_case_00015_05_interactive_3d.png",
+      "demo_case_00015_06_interactive_3d_chart.png"
+    ],
+    "errors": [],
+    "exceptions": []
+  },
+  {
+    "case": "case_00000",
+    "files": [
+      "demo_case_00000_01_overview.png",
+      "demo_case_00000_02_plan.png",
+      "demo_case_00000_03_plan_3d.png",
+      "demo_case_00000_04_plan_3d_chart.png",
+      "demo_case_00000_05_interactive_3d.png",
+      "demo_case_00000_06_interactive_3d_chart.png"
+    ],
+    "errors": [],
+    "exceptions": []
+  },
+  {
+    "case": "case_00050",
+    "files": [
+      "demo_case_00050_01_overview.png",
+      "demo_case_00050_02_plan.png",
+      "demo_case_00050_03_plan_3d.png",
+      "demo_case_00050_04_plan_3d_chart.png",
+      "demo_case_00050_05_interactive_3d.png",
+      "demo_case_00050_06_interactive_3d_chart.png"
+    ],
+    "errors": [],
+    "exceptions": []
+  },
+  {
+    "case": "case_00005",
+    "files": [
+      "demo_case_00005_01_overview.png",
+      "demo_case_00005_02_plan.png",
+      "demo_case_00005_03_plan_3d.png",
+      "demo_case_00005_04_plan_3d_chart.png",
+      "demo_case_00005_05_interactive_3d.png",
+      "demo_case_00005_06_interactive_3d_chart.png"
+    ],
+    "errors": [],
+    "exceptions": []
+  },
+  {
+    "case": "case_00122",
+    "files": [
+      "demo_case_00122_01_overview.png",
+      "demo_case_00122_02_plan.png",
+      "demo_case_00122_03_plan_3d.png",
+      "demo_case_00122_04_plan_3d_chart.png",
+      "demo_case_00122_05_interactive_3d.png",
+      "demo_case_00122_06_interactive_3d_chart.png"
+    ],
+    "errors": [],
+    "exceptions": []
+  },
+  {
+    "case": "case_00015",
+    "files": [
+      "demo_mobile_case_00015_01_overview.png",
+      "demo_mobile_case_00015_02_plan.png",
+      "demo_mobile_case_00015_03_plan_3d.png",
+      "demo_mobile_case_00015_04_plan_3d_chart.png",
+      "demo_mobile_case_00015_05_interactive_3d.png",
+      "demo_mobile_case_00015_06_interactive_3d_chart.png"
+    ],
+    "errors": [],
+    "exceptions": []
+  }
+]
