@@ -900,7 +900,9 @@ def main() -> None:
                     help="Balanced is recommended for free hosting.",
                 )
             with control_columns[4]:
-                camera_view = st.selectbox("View from", list(CAMERA_PRESETS), index=0)
+                camera_view = st.selectbox(
+                    "View from", list(CAMERA_PRESETS), index=0, key="three_d_view_from"
+                )
             has_renal_vessel_labels = any(
                 label in available_labels
                 for label in (CanonicalLabel.RENAL_ARTERY, CanonicalLabel.RENAL_VEIN)
