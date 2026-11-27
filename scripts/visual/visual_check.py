@@ -145,6 +145,9 @@ def main() -> None:
         browser.close()
     (out / f"{args.prefix}results.json").write_text(json.dumps(results, indent=2))
     print(json.dumps(results, indent=2))
+    problems = [item for item in results if item.get("failure") or item.get("exceptions")]
+    if problems:
+        raise SystemExit(f"{len(problems)} page(s) failed or showed a Streamlit exception")
 
 
 if __name__ == "__main__":
