@@ -1,3 +1,6 @@
 -r requirements.txt
 pytest>=8.0
 ruff>=0.6
+# Independent DICOM orientation gate (tests/test_dicom_orientation.py)
+pydicom>=3.0
+SimpleITK>=2.3

@@ -47,6 +47,7 @@ from renal_explorer.remote_data import (  # noqa: E402
     ensure_demo_case,
 )
 from renal_explorer.rendering import (  # noqa: E402
+    CAMERA_PRESETS,
     VIEW_AXES,
     legend_html,
     render_view,
@@ -264,6 +265,7 @@ def cached_prediction_package(
 def build_3d_figure(
     label_meshes: list[tuple[CanonicalLabel, dict]],
     vessel_candidates: dict | None,
+    view: str = "Anterior",
 ) -> go.Figure:
     figure = go.Figure()
 
@@ -325,11 +327,6 @@ def build_3d_figure(
                 hovertemplate="Candidate vessel<extra></extra>",
             )
         )
-        add_centerline(
-            vessel_candidates,
-            "Candidate vessel",
-            "rgba(255,255,255,0.82)",
-        )
 
     figure.update_layout(
         height=720,
@@ -337,14 +334,46 @@ def build_3d_figure(
         legend={"orientation": "h", "y": 1.02, "x": 0.0},
         scene={
             "aspectmode": "data",
-            "xaxis_title": "Right ↔ Left (mm)",
-            "yaxis_title": "Anterior ↔ Posterior (mm)",
-            "zaxis_title": "Inferior ↔ Superior (mm)",
-            "camera": {"eye": {"x": 1.45, "y": 1.45, "z": 1.1}},
+            # RAS+ world coordinates: the sign says the direction unambiguously.
+            "xaxis_title": "x mm (+ patient right)",
+            "yaxis_title": "y mm (+ anterior)",
+            "zaxis_title": "z mm (+ superior)",
+            "camera": CAMERA_PRESETS.get(view, CAMERA_PRESETS["Anterior"]),
         },
-        uirevision="renal-3d",
+        uirevision=f"renal-3d-{view}",
     )
     return figure
+
+
+def navigation_targets(analysis: dict, affine: np.ndarray, shape) -> dict[str, np.ndarray]:
+    """Voxel points the views can centre on: each tumour, each kidney, the volume centre."""
+
+    inverse = np.linalg.inv(affine)
+    targets: dict[str, np.ndarray] = {}
+
+    def to_voxel(world) -> np.ndarray:
+        voxel = (inverse @ np.append(np.asarray(world, dtype=float), 1.0))[:3]
+        return np.clip(np.rint(voxel), 0, np.asarray(shape) - 1).astype(int)
+
+    for number, tumor in enumerate(analysis.get("tumor_components", []), start=1):
+        side = tumor.get("laterality", "")
+        targets[f"Tumour {number} ({side.lower()})"] = to_voxel(tumor["centroid_world_mm"])
+    for kidney in analysis.get("kidney_components", []):
+        side = kidney.get("laterality", "Unknown")
+        name = f"{side} kidney" if side != "Unknown" else "Kidney"
+        while name in targets:
+            name += " (2)"
+        targets[name] = to_voxel(kidney["centroid_world_mm"])
+    targets["Volume centre"] = (np.asarray(shape) - 1) // 2
+    return targets
+
+
+def _query_index(options, parameter: str) -> int:
+    """Preselect from a URL parameter (?case=case_00015) for shareable links."""
+
+    wanted = st.query_params.get(parameter)
+    options = list(options)
+    return options.index(wanted) if wanted in options else 0
 
 
 def root_default(dataset_key: str) -> str:
@@ -440,6 +469,7 @@ def main() -> None:
             case_id = st.selectbox(
                 "Public case",
                 demo_case_ids(),
+                index=_query_index(demo_case_ids(), "case"),
                 format_func=demo_case_label,
             )
             dataset_root = str(
@@ -479,7 +509,9 @@ def main() -> None:
                     found_id: (image, segmentation)
                     for found_id, image, segmentation in cases
                 }
-                case_id = st.selectbox("Case", list(case_lookup))
+                case_id = st.selectbox(
+                    "Case", list(case_lookup), index=_query_index(list(case_lookup), "case")
+                )
                 image_path, segmentation_path = case_lookup[case_id]
 
         st.caption(f"License: {adapter.info.license_name}")
@@ -661,30 +693,24 @@ def main() -> None:
             ]
 
         with st.expander("Navigation", expanded=True):
-            link_views = st.checkbox("Link views", value=True)
-            show_crosshairs = st.checkbox("Show linked crosshairs", value=True)
-            if link_views:
-                slice_percentage = st.slider("Position (%)", 0, 100, 50)
-                indices = {
-                    orientation: int(
-                        round(
-                            (case.image.shape[axis] - 1)
-                            * (slice_percentage / 100.0)
-                        )
-                    )
-                    for orientation, axis in VIEW_AXES.items()
-                }
-            else:
-                indices = {
-                    orientation: st.slider(
-                        f"{orientation} slice",
-                        0,
-                        case.image.shape[axis] - 1,
-                        case.image.shape[axis] // 2,
-                        key=f"slice_{dataset_key}_{case_id}_{orientation}",
-                    )
-                    for orientation, axis in VIEW_AXES.items()
-                }
+            focus_points = navigation_targets(analysis, case.affine, case.image.shape)
+            focus = st.selectbox(
+                "Centre views on",
+                list(focus_points),
+                key=f"focus_{dataset_key}_{case_id}",
+                help="All three views pass through this point; fine-tune with the sliders.",
+            )
+            show_crosshairs = st.checkbox("Show crosshairs", value=True)
+            indices = {
+                orientation: st.slider(
+                    f"{orientation} slice",
+                    0,
+                    case.image.shape[axis] - 1,
+                    int(focus_points[focus][axis]),
+                    key=f"slice_{dataset_key}_{case_id}_{orientation}_{focus}",
+                )
+                for orientation, axis in VIEW_AXES.items()
+            }
 
         if st.button("Clear memory cache", width="stretch"):
             st.cache_data.clear()
@@ -741,7 +767,7 @@ def main() -> None:
                 visible_labels=visible_labels,
                 overlay_mode=overlay_mode,
                 opacity=opacity,
-                linked_indices=indices if link_views and show_crosshairs else None,
+                linked_indices=indices if show_crosshairs else None,
                 supplemental_segmentation=(
                     imported_prediction.segmentation
                     if imported_prediction is not None
@@ -853,13 +879,17 @@ def main() -> None:
                 vessel_model_bundle = None
                 model_error = str(exc)
 
-            control_columns = st.columns(4)
+            control_columns = st.columns(5)
             with control_columns[0]:
                 detail = st.selectbox(
                     "3D detail",
                     SURFACE_QUALITIES,
                     index=1,
                     help="Balanced is recommended for free hosting.",
+                )
+            with control_columns[4]:
+                camera_view = st.selectbox(
+                    "View from", list(CAMERA_PRESETS), index=0, key="three_d_view_from"
                 )
             has_renal_vessel_labels = any(
                 label in available_labels
@@ -869,9 +899,11 @@ def main() -> None:
                 np.any(imported_prediction.segmentation)
             )
             with control_columns[1]:
+                # Off by default unless a validated model is installed: the image filter
+                # is unlabeled, brightness based and can show vessels that are not there.
                 include_generated_vessels = st.checkbox(
-                    "Add generated vessels",
-                    value=not has_renal_vessel_labels,
+                    "Add generated vessels (experimental)",
+                    value=not has_renal_vessel_labels and vessel_model_bundle is not None,
                     disabled=has_renal_vessel_labels,
                     help=(
                         "Uses a validated KiPA22 model when installed, or an explicitly "
@@ -1023,7 +1055,7 @@ def main() -> None:
                 if not label_meshes and vessel_candidates is None:
                     st.warning("No surface could be generated with the current selections.")
                 else:
-                    figure = build_3d_figure(label_meshes, vessel_candidates)
+                    figure = build_3d_figure(label_meshes, vessel_candidates, camera_view)
                     st.plotly_chart(
                         figure,
                         config={"displaylogo": False, "scrollZoom": True},

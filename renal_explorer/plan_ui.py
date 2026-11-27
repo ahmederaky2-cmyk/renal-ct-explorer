@@ -13,7 +13,7 @@ import streamlit as st
 from .exports import plan_report_pdf, stl_zip
 from .labels import LABEL_COLORS, CanonicalLabel
 from .planning import PlanningError, assemble_plan, plan_geometry
-from .rendering import render_view
+from .rendering import CAMERA_PRESETS, render_view
 from .three_d import surface_mesh
 
 BRANCH_DEPTHS = {
@@ -115,6 +115,7 @@ def build_plan_figure(
     plan: dict[str, Any],
     show_territories: bool,
     show_distances: bool,
+    view: str = "Anterior",
 ) -> go.Figure:
     figure = go.Figure()
     summary = plan["summary"]
@@ -201,12 +202,13 @@ def build_plan_figure(
         legend={"orientation": "h", "y": 1.02, "x": 0.0},
         scene={
             "aspectmode": "data",
-            "xaxis_title": "Right ↔ Left (mm)",
-            "yaxis_title": "Anterior ↔ Posterior (mm)",
-            "zaxis_title": "Inferior ↔ Superior (mm)",
-            "camera": {"eye": {"x": 1.4, "y": 1.4, "z": 0.9}},
+            # RAS+ world coordinates: the sign says the direction unambiguously.
+            "xaxis_title": "x mm (+ patient right)",
+            "yaxis_title": "y mm (+ anterior)",
+            "zaxis_title": "z mm (+ superior)",
+            "camera": CAMERA_PRESETS.get(view, CAMERA_PRESETS["Anterior"]),
         },
-        uirevision="renal-plan",
+        uirevision=f"renal-plan-{view}",
     )
     return figure
 
@@ -506,9 +508,13 @@ def render_plan_tab(
         st.caption(f"• {note}")
 
     st.markdown("**3D plan**")
-    view_columns = st.columns(4)
+    view_columns = st.columns(5)
     with view_columns[0]:
-        quality = st.selectbox("Plan detail", ("Fast", "Balanced", "Detailed"), index=0)
+        quality = st.selectbox("Plan detail", ("Fast", "Balanced", "Detailed"), index=1)
+    with view_columns[4]:
+        camera_view = st.selectbox(
+            "View from", list(CAMERA_PRESETS), index=0, key="plan_view_from"
+        )
     with view_columns[1]:
         show_territories = st.checkbox(
             "Colour territories", value=bool(territories), disabled=not territories
@@ -539,7 +545,7 @@ def render_plan_tab(
                     key, name, quality, mask, display["affine"], display["spacing"]
                 )
         st.plotly_chart(
-            build_plan_figure(meshes, plan, show_territories, show_distances),
+            build_plan_figure(meshes, plan, show_territories, show_distances, camera_view),
             config={"displaylogo": False, "scrollZoom": True},
         )
 
