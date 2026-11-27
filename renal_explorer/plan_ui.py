@@ -512,7 +512,9 @@ def render_plan_tab(
     with view_columns[0]:
         quality = st.selectbox("Plan detail", ("Fast", "Balanced", "Detailed"), index=1)
     with view_columns[4]:
-        camera_view = st.selectbox("View from", list(CAMERA_PRESETS), index=0)
+        camera_view = st.selectbox(
+            "View from", list(CAMERA_PRESETS), index=0, key="plan_view_from"
+        )
     with view_columns[1]:
         show_territories = st.checkbox(
             "Colour territories", value=bool(territories), disabled=not territories
