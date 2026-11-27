@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import re
 import zipfile
 from datetime import datetime, timezone
@@ -67,6 +68,25 @@ def stl_zip(
                 f"{_safe_name(name)}.stl", stl_bytes(mesh["vertices"], mesh["faces"], name)
             )
         archive.writestr("README.txt", readme)
+        quality = {
+            name: {
+                key: mesh["quality"].get(key)
+                for key in (
+                    "role",
+                    "method",
+                    "source_volume_ml",
+                    "mesh_volume_ml",
+                    "volume_error_pct",
+                    "surface_to_mask_p95_mm",
+                    "target_spacing_mm",
+                    "watertight",
+                )
+            }
+            for name, mesh in meshes.items()
+            if mesh is not None and isinstance(mesh.get("quality"), dict)
+        }
+        if quality:
+            archive.writestr("mesh_quality.json", json.dumps(quality, indent=2, default=str))
     return buffer.getvalue()
 
 
