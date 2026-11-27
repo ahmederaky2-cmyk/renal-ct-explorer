@@ -9,6 +9,34 @@ from .labels import LABEL_COLORS, LABEL_NAMES, CanonicalLabel
 
 VIEW_AXES = {"Axial": 2, "Coronal": 1, "Sagittal": 0}
 
+# Radiological convention (as on every PACS): axial and coronal views show the patient's
+# right on the image left; sagittal views show anterior on the image left. The volume is
+# canonical RAS+ (x grows to the patient's right, y anterior, z superior).
+# Labels for the (left, right, top, bottom) image edges:
+ORIENTATION_MARKERS = {
+    "Axial": ("R", "L", "A", "P"),
+    "Coronal": ("R", "L", "S", "I"),
+    "Sagittal": ("A", "P", "S", "I"),
+}
+
+
+# 3D camera presets in RAS+ world space. "Anterior" faces the patient, so the patient's
+# right is on the screen's left, matching the radiological slice layout.
+CAMERA_PRESETS = {
+    "Anterior": {"eye": {"x": 0.0, "y": 2.1, "z": 0.25}, "up": {"x": 0, "y": 0, "z": 1}},
+    "Posterior": {"eye": {"x": 0.0, "y": -2.1, "z": 0.25}, "up": {"x": 0, "y": 0, "z": 1}},
+    "From patient's right": {
+        "eye": {"x": 2.1, "y": 0.0, "z": 0.25},
+        "up": {"x": 0, "y": 0, "z": 1},
+    },
+    "From patient's left": {
+        "eye": {"x": -2.1, "y": 0.0, "z": 0.25},
+        "up": {"x": 0, "y": 0, "z": 1},
+    },
+    "Superior": {"eye": {"x": 0.0, "y": 0.0, "z": 2.1}, "up": {"x": 0, "y": 1, "z": 0}},
+    "Inferior": {"eye": {"x": 0.0, "y": 0.0, "z": -2.1}, "up": {"x": 0, "y": 1, "z": 0}},
+}
+
 
 def apply_ct_window(image: np.ndarray, level: float, width: float) -> np.ndarray:
     width = max(float(width), 1.0)
@@ -18,7 +46,9 @@ def apply_ct_window(image: np.ndarray, level: float, width: float) -> np.ndarray
 
 
 def _extract_plane(volume: np.ndarray, orientation: str, index: int) -> np.ndarray:
-    return np.rot90(np.take(volume, index, axis=VIEW_AXES[orientation]))
+    # rot90 puts superior/anterior at the top with increasing x (or y) to the right;
+    # fliplr then gives the radiological left-right (and anterior-left sagittal) layout.
+    return np.fliplr(np.rot90(np.take(volume, index, axis=VIEW_AXES[orientation])))
 
 
 def _display_spacing(
@@ -65,10 +95,10 @@ def _crosshair_position(
     y_index = indices["Coronal"]
     z_index = indices["Axial"]
     if orientation == "Axial":
-        return shape[1] - 1 - y_index, x_index
+        return shape[1] - 1 - y_index, shape[0] - 1 - x_index
     if orientation == "Coronal":
-        return shape[2] - 1 - z_index, x_index
-    return shape[2] - 1 - z_index, y_index
+        return shape[2] - 1 - z_index, shape[0] - 1 - x_index
+    return shape[2] - 1 - z_index, shape[1] - 1 - y_index
 
 
 def _draw_crosshair(image: np.ndarray, row: int, column: int) -> None:
@@ -93,6 +123,7 @@ def render_view(
     opacity: float,
     linked_indices: dict[str, int] | None = None,
     supplemental_segmentation: np.ndarray | None = None,
+    markers: bool = True,
 ) -> np.ndarray:
     image_plane = _extract_plane(image, orientation, index)
     segmentation_plane = (
@@ -142,7 +173,32 @@ def render_view(
     if linked_indices is not None:
         row, column = _crosshair_position(orientation, linked_indices, image.shape)
         _draw_crosshair(rgb, round(row * scale[0]), round(column * scale[1]))
+    if markers:
+        rgb = draw_orientation_markers(rgb, orientation)
     return rgb
+
+
+def draw_orientation_markers(rgb: np.ndarray, orientation: str) -> np.ndarray:
+    """Burn R/L/A/P/S/I letters into the image edges (they stay on screenshots and PDFs)."""
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    left, right, top, bottom = ORIENTATION_MARKERS[orientation]
+    image = Image.fromarray(rgb)
+    draw = ImageDraw.Draw(image)
+    size = max(12, int(min(image.size) * 0.06))
+    try:
+        font = ImageFont.load_default(size=size)
+    except TypeError:  # Pillow < 10.1
+        font = ImageFont.load_default()
+    width, height = image.size
+    margin = max(3, size // 4)
+    style = {"fill": (255, 214, 64), "font": font, "stroke_width": 2, "stroke_fill": (0, 0, 0)}
+    draw.text((margin, height / 2), left, anchor="lm", **style)
+    draw.text((width - margin, height / 2), right, anchor="rm", **style)
+    draw.text((width / 2, margin), top, anchor="mt", **style)
+    draw.text((width / 2, height - margin), bottom, anchor="mb", **style)
+    return np.asarray(image)
 
 
 def legend_html(labels: Iterable[CanonicalLabel]) -> str:
