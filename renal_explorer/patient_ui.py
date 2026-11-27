@@ -73,6 +73,15 @@ def _store():
     return PatientStore()
 
 
+def patient_provenance(case_id: str) -> dict | None:
+    """Segmentation provenance of a patient case (models, warnings, manual corrections)."""
+
+    try:
+        return _store().get(case_id).provenance()
+    except (KeyError, OSError, ValueError):
+        return None
+
+
 def _case_label(case) -> str:
     status = case.status()
     created = time.strftime("%d.%m %H:%M", time.localtime(status.get("created", 0)))
