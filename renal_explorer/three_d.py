@@ -37,11 +37,23 @@ SURFACE_PROFILES = {
     },
 }
 
+# Display-only smoothing. Volumes, distances and scores come from the voxel labels, never
+# from these surfaces, so surfaces may be smoothed enough to remove slice "terraces".
+# The signed-distance field is blurred by this many voxels along each axis (so a 5 mm slice
+# axis is smoothed at its own scale), and smoothing may move the surface by up to half of
+# the coarsest voxel, the height of a terrace. Volume stays calibrated by the iso-level.
+DISPLAY_SDF_SIGMA_VOXELS = 0.6
+DISPLAY_MAX_DISPLACEMENT_FRACTION = 0.5
+
 VESSEL_THRESHOLDS = {
     "Strict": (99.6, 99.0),
     "Balanced": (99.0, 97.8),
     "Sensitive": (98.5, 96.5),
 }
+
+# "Reference" is the geometrically authoritative surface used for exports: marching cubes
+# on the native grid, with no blur, smoothing or decimation.
+REFERENCE_QUALITY = "Reference"
 
 VESSEL_TARGET_SPACING_MM = {
     "Fast": 2.0,
@@ -357,11 +369,12 @@ def _surface_from_binary_mask(
     float,
     float,
 ]:
+    reference = quality == REFERENCE_QUALITY
     profile = SURFACE_PROFILES.get(quality, SURFACE_PROFILES["Balanced"])
     target_spacing_mm = float(profile["target_spacing_mm"])
     spacing_array = np.asarray(spacing, dtype=float)
     source_volume_mm3 = float(np.count_nonzero(mask) * np.prod(spacing_array))
-    if source_volume_mm3 < 5_000.0:
+    if not reference and source_volume_mm3 < 5_000.0:
         small_structure_spacing = {
             "Fast": 1.0,
             "Balanced": 0.75,
@@ -385,6 +398,36 @@ def _surface_from_binary_mask(
         cropped,
         sampling=tuple(spacing_array),
     ) - ndi.distance_transform_edt(~cropped, sampling=tuple(spacing_array))
+    mask_distance = signed_distance
+    if reference:
+        # Fixed, documented rule (no search, resampling, smoothing or decimation):
+        # Lewiner marching cubes at level 0 of the native-grid signed distance.
+        vertices, faces, _normals, _values = marching_cubes(
+            signed_distance.astype(np.float32),
+            level=0.0,
+            step_size=1,
+            allow_degenerate=False,
+            method="lewiner",
+        )
+        raw_world = _voxel_to_world(vertices + origin, affine)
+        surface_to_mask = _surface_to_mask_p95(raw_world, mask_distance, affine, origin)
+        return (
+            raw_world.astype(np.float32),
+            faces.astype(np.int32),
+            source_volume_mm3,
+            0.0,
+            signed_distance,
+            origin,
+            np.ones(3),
+            float(np.min(spacing_array)),
+            0.0,
+            surface_to_mask,
+        )
+    # Display preview only. Blur scale in mm per axis (sigma_voxels x spacing), so a
+    # 5 mm slice axis is smoothed over about 3 mm and a 0.8 mm axis over about 0.5 mm.
+    signed_distance = ndi.gaussian_filter(
+        signed_distance, sigma=DISPLAY_SDF_SIGMA_VOXELS, mode="nearest"
+    )
     output_shape = _output_shape_for_spacing(
         signed_distance.shape,
         spacing_array,
@@ -412,12 +455,16 @@ def _surface_from_binary_mask(
     volume_tolerance = float(profile["volume_tolerance_pct"])
     if source_volume_mm3 < 5_000.0:
         volume_tolerance = max(volume_tolerance, 6.0)
+    maximum_displacement = max(
+        float(profile["max_displacement_p95_mm"]),
+        DISPLAY_MAX_DISPLACEMENT_FRACTION * float(np.max(spacing_array)),
+    )
     constrained_world, smoothing_p95 = _constrain_smoothing(
         raw_world,
         smoothed_world,
         faces,
         source_volume_mm3,
-        float(profile["max_displacement_p95_mm"]),
+        maximum_displacement,
         volume_tolerance,
     )
     final_vertices, final_faces = _decimate(
@@ -448,7 +495,29 @@ def _surface_from_binary_mask(
         input_per_output,
         target_spacing_mm,
         iso_level,
+        _surface_to_mask_p95(final_vertices, mask_distance, affine, origin),
     )
+
+
+def _surface_to_mask_p95(
+    world_vertices: np.ndarray,
+    mask_distance: np.ndarray,
+    affine: np.ndarray,
+    origin_voxels: np.ndarray,
+) -> float:
+    """95th percentile distance (mm) from mesh vertices to the voxel-mask boundary.
+
+    The unblurred signed distance of the source mask is sampled at each vertex. Its
+    zero level lies half a voxel outside boundary voxel centres, so this measures how
+    far the displayed surface departs from the mask, not just from a smoothed copy.
+    """
+
+    if world_vertices.size == 0:
+        return 0.0
+    homogeneous = np.c_[world_vertices.astype(float), np.ones(world_vertices.shape[0])]
+    voxel = (np.linalg.inv(affine) @ homogeneous.T)[:3].T - np.asarray(origin_voxels)
+    sampled = ndi.map_coordinates(mask_distance, voxel.T, order=1, mode="nearest")
+    return float(np.percentile(np.abs(sampled), 95))
 
 
 def _line_segments_from_skeleton(
@@ -502,7 +571,12 @@ def surface_mesh(
     label_value: int,
     quality: str = "Balanced",
 ) -> MeshData | None:
-    """Create a smoothed, physically constrained surface for one mapped label."""
+    """Create a surface for one mapped label.
+
+    ``quality="Reference"`` gives the unsmoothed native-grid surface used for exports;
+    the other profiles are display previews whose departure from the voxel mask is
+    reported as ``surface_to_mask_p95_mm``.
+    """
 
     mask = segmentation == int(label_value)
     if not np.any(mask):
@@ -517,6 +591,7 @@ def surface_mesh(
         input_per_output,
         target_spacing_mm,
         iso_level,
+        surface_to_mask_p95,
     ) = _surface_from_binary_mask(mask, affine, spacing, quality)
     mesh: MeshData = {
         "vertices": vertices,
@@ -528,10 +603,17 @@ def surface_mesh(
             source_volume,
             smoothing_p95,
             target_spacing_mm,
-            "Isotropic signed distance + Lewiner + VTK windowed sinc",
+            (
+                "Reference: Lewiner marching cubes at level 0 of the native-grid signed "
+                "distance; no resampling, calibration, smoothing or decimation"
+                if quality == REFERENCE_QUALITY
+                else "Display preview: blurred signed distance + Lewiner + VTK windowed sinc"
+            ),
         ),
     }
     mesh["quality"]["calibrated_iso_level_mm"] = iso_level
+    mesh["quality"]["surface_to_mask_p95_mm"] = surface_to_mask_p95
+    mesh["quality"]["role"] = "reference" if quality == REFERENCE_QUALITY else "display"
     if int(label_value) in VESSEL_LABELS:
         isotropic_mask = isotropic_distance >= 0.0
         mesh["centerline_points"] = _line_segments_from_skeleton(

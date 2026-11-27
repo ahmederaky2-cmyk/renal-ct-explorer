@@ -30,6 +30,7 @@ from renal_explorer.labels import (  # noqa: E402
 from renal_explorer.models import CaseFiles  # noqa: E402
 from renal_explorer.patient_ui import (  # noqa: E402
     PATIENT_MODE,
+    patient_provenance,
     render_correction_panel,
     render_patient_workspace,
     require_password,
@@ -133,11 +134,12 @@ def load_case_bundle(
     case_id: str,
     image_path: str,
     segmentation_path: str,
-    image_signature: tuple[int, ...],
-    segmentation_signature: tuple[int, ...] | None,
+    image_digest: str,
+    segmentation_digest: str | None,
     target_spacing_mm: float | None = None,
 ):
-    del image_signature, segmentation_signature
+    # Keyed by content (SHA-256), not by path, size or timestamps.
+    del image_digest, segmentation_digest
     adapter = get_adapter(dataset_key)
     files = CaseFiles(
         case_id=case_id,
@@ -167,7 +169,7 @@ def cached_label_surface(
 def cached_candidate_vessels(
     dataset_key: str,
     case_id: str,
-    image_signature: tuple[int, ...],
+    image_signature: str,
     segmentation_signature: str,
     sensitivity: str,
     detail: str,
@@ -202,7 +204,7 @@ def cached_vessel_model_bundle(
 def cached_ml_vessels(
     dataset_key: str,
     case_id: str,
-    image_signature: tuple[int, ...],
+    image_signature: str,
     segmentation_signature: str,
     model_sha256: str,
     _image: np.ndarray,
@@ -498,13 +500,21 @@ def main() -> None:
 
     try:
         with st.spinner(f"Loading {case_id} on the server…"):
+            # Content identity: a file replaced in place (same name, size and restored
+            # timestamp) gets a new hash. Hashes are computed once per file signature.
+            ct_digest = cached_file_sha256(image_path, file_signature(image_path))
+            segmentation_digest = (
+                cached_file_sha256(segmentation_path, file_signature(segmentation_path))
+                if segmentation_path
+                else None
+            )
             case, analysis = load_case_bundle(
                 dataset_key,
                 case_id,
                 image_path,
                 segmentation_path,
-                file_signature(image_path),
-                file_signature(segmentation_path),
+                ct_digest,
+                segmentation_digest,
                 demo_target_spacing(access_mode, PATIENT_MODE),
             )
     except (DatasetError, OSError, ValueError) as exc:
@@ -557,11 +567,8 @@ def main() -> None:
                 try:
                     prediction_payload = prediction_upload.getvalue()
                     package_digest = hashlib.sha256(prediction_payload).hexdigest()
-                    image_signature = file_signature(image_path)
-                    if image_signature is None:
-                        raise PredictionPackageError("The selected CT file is unavailable.")
                     with st.spinner("Checking prediction identity and geometry…"):
-                        image_digest = cached_file_sha256(image_path, image_signature)
+                        image_digest = ct_digest
                         # Verify against the full-resolution CT geometry, then (demo only)
                         # reduce the prediction exactly as the CT was reduced.
                         if resolution.get("reduced"):
@@ -617,9 +624,9 @@ def main() -> None:
     # grid, or under a replaced CT (the sinus proxy reads HU), must never share results.
     active_grid = grid_token(case.image.shape, case.affine, case.metadata.get("resolution"))
     segmentation_cache_token = (
-        f"{file_signature(segmentation_path)}:"
+        f"{segmentation_digest}:"
         f"{imported_prediction.package_sha256 if imported_prediction else 'source'}:"
-        f"ct={file_signature(image_path)}:{active_grid}"
+        f"ct={ct_digest}:{active_grid}"
     )
 
     with st.sidebar:
@@ -767,6 +774,11 @@ def main() -> None:
             analysis=analysis,
             imported_prediction=imported_prediction,
             segmentation_token=segmentation_cache_token,
+            ct_digest=ct_digest,
+            segmentation_digest=segmentation_digest,
+            patient_provenance=(
+                patient_provenance(case_id) if access_mode == "Patient cases" else None
+            ),
         )
     with tab_measurements:
         if not regions:
@@ -960,7 +972,7 @@ def main() -> None:
                         surface_signature = (
                             f"prediction:{imported_prediction.package_sha256}:{active_grid}"
                             if imported_vessel_label
-                            else f"source:{file_signature(segmentation_path)}:{active_grid}"
+                            else f"source:{segmentation_digest}:{active_grid}"
                         )
                         mesh = cached_label_surface(
                             dataset_key,
@@ -985,7 +997,7 @@ def main() -> None:
                         ml_prediction = cached_ml_vessels(
                             dataset_key,
                             case_id,
-                            file_signature(image_path),
+                            ct_digest,
                             segmentation_cache_token,
                             vessel_model_bundle.manifest.artifact_sha256,
                             case.image,
@@ -1010,7 +1022,7 @@ def main() -> None:
                         vessel_candidates = cached_candidate_vessels(
                             dataset_key,
                             case_id,
-                            file_signature(image_path),
+                            ct_digest,
                             segmentation_cache_token,
                             vessel_sensitivity,
                             detail,

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -12,9 +14,25 @@ import streamlit as st
 
 from .exports import plan_report_pdf, stl_zip
 from .labels import LABEL_COLORS, CanonicalLabel
+from .manifest import build_manifest, segmentation_source
 from .planning import PlanningError, assemble_plan, plan_geometry
 from .rendering import render_view
-from .three_d import surface_mesh
+from .review import (
+    ACCEPTED,
+    QA_PASSED,
+    REJECTED,
+    REVIEW_CHECKS,
+    REVIEWED,
+    STATE_LABELS,
+    UNREVIEWED,
+    ReviewError,
+    ReviewStore,
+    automated_qa,
+    lesion_review_key,
+    overall_state,
+    transition,
+)
+from .three_d import REFERENCE_QUALITY, surface_mesh
 
 BRANCH_DEPTHS = {
     1: "Divisions (1st significant bifurcation)",
@@ -306,6 +324,9 @@ def render_plan_tab(
     analysis: dict[str, Any],
     imported_prediction,
     segmentation_token: str,
+    ct_digest: str | None = None,
+    segmentation_digest: str | None = None,
+    patient_provenance: dict | None = None,
 ) -> None:
     st.caption(
         "Research prototype. Scores are automated approximations of R.E.N.A.L. and PADUA "
@@ -520,7 +541,7 @@ def render_plan_tab(
     st.markdown("**3D plan**")
     view_columns = st.columns(4)
     with view_columns[0]:
-        quality = st.selectbox("Plan detail", ("Fast", "Balanced", "Detailed"), index=0)
+        quality = st.selectbox("Plan detail", ("Fast", "Balanced", "Detailed"), index=1)
     with view_columns[1]:
         show_territories = st.checkbox(
             "Colour territories", value=bool(territories), disabled=not territories
@@ -535,6 +556,7 @@ def render_plan_tab(
     if st.button("Build 3D plan", key=f"button_{build_key}", width="stretch"):
         st.session_state[build_key] = True
     meshes: dict[str, dict[str, Any] | None] = {}
+    export_sources: dict[str, tuple[str, np.ndarray]] = {}
     if st.session_state.get(build_key, False):
         sources = {
             "Kidney": display["kidney"],
@@ -550,13 +572,83 @@ def render_plan_tab(
                 meshes[name] = cached_plan_mesh(
                     key, name, quality, mask, display["affine"], display["spacing"]
                 )
+                export_sources[name] = (key, mask)
         st.plotly_chart(
             build_plan_figure(meshes, plan, show_territories, show_distances),
             config={"displaylogo": False, "scrollZoom": True},
         )
 
-    downloads = st.columns(3)
+    # Reference (unsmoothed) surfaces: the authoritative geometry for QA and exports.
+    reference_meshes = {
+        name: cached_plan_mesh(
+            key, name, REFERENCE_QUALITY, mask, display["affine"], display["spacing"]
+        )
+        for name, (key, mask) in export_sources.items()
+    }
     case_label = f"{adapter.info.name} {case.case_id}"
+    qa = automated_qa(
+        reference_meshes,
+        display["spacing"],
+        bool(summary["resolution"]["reduced"]),
+        expected=tuple(export_sources),
+    )
+    # One review per lesion *and* plan settings: switching tumour or margin starts afresh.
+    review_key = lesion_review_key(
+        ct_digest,
+        segmentation_token,
+        summary["tumor_center_mm"],
+        float(margin_mm),
+        int(branch_depth),
+    )
+    record = _render_review_panel(review_key, case_label, qa, patient_provenance is not None)
+    state = overall_state(qa["status"], record)
+    summary["model_review"] = {
+        "state": state,
+        "state_label": STATE_LABELS[state],
+        "qa_status": qa["status"],
+        "clinician_status": record.status,
+        "reviewer": record.reviewer or None,
+        "ct_sha256": ct_digest,
+    }
+    manifest = build_manifest(
+        case_id=case.case_id,
+        dataset=adapter.info.name,
+        ct_sha256=ct_digest,
+        segmentation_sha256=segmentation_digest,
+        image_shape=case.image.shape,
+        spacing=case.spacing,
+        affine=case.affine,
+        resolution=case.metadata.get("resolution"),
+        segmentation=segmentation_source(case, imported_prediction, patient_provenance),
+        reconstruction={
+            "algorithm": "Label masks -> signed distance -> Lewiner marching cubes",
+            "exported_surfaces": "reference (native planning grid, no smoothing/decimation)",
+            "planning_grid_spacing_mm": [float(value) for value in display["spacing"]],
+            "planning_grid_affine": np.asarray(display["affine"], float).round(6).tolist(),
+            "planning_grid_shape": [int(value) for value in display["tumor"].shape],
+            # The planning grid is a crop (and, for large volumes, a stride) of the
+            # loaded case grid; the loaded grid may itself be a demo reduction.
+            "planning_grid_crop_start": [int(value) for value in display["crop_start"]],
+            "planning_grid_stride": [int(value) for value in np.atleast_1d(display["stride"])],
+            "source_labelmaps": "labelmaps/*.nii in the STL zip (planning grid, RAS+)",
+            "display_detail": quality,
+            "parameters": {
+                "tumor_index": int(tumor_index),
+                "margin_mm": float(margin_mm),
+                "branch_depth": int(branch_depth),
+            },
+        },
+        mesh_quality={
+            name: mesh["quality"] for name, mesh in reference_meshes.items() if mesh is not None
+        },
+        qa=qa,
+        review=record.to_dict(),
+        state=state,
+        limitations=record.limitations,
+    )
+    summary["manifest"] = manifest
+
+    downloads = st.columns(3)
     # Slice from the tumour's world position mapped onto the case's current grid.
     inverse = np.linalg.inv(case.affine)
     center_world = np.append(np.asarray(summary["tumor_center_mm"], dtype=float), 1.0)
@@ -597,10 +689,23 @@ def render_plan_tab(
             width="stretch",
         )
     with downloads[2]:
-        available = {name: mesh for name, mesh in meshes.items() if mesh is not None}
+        # Exports use the unsmoothed reference surfaces, never the display previews.
+        available = {name: mesh for name, mesh in reference_meshes.items() if mesh is not None}
         st.download_button(
             "3D surfaces (STL zip)",
-            data=stl_zip(available, resolution=summary["resolution"]) if available else b"",
+            data=(
+                stl_zip(
+                    available,
+                    resolution=summary["resolution"],
+                    manifest=manifest,
+                    labelmaps={
+                        name: (mask, display["affine"])
+                        for name, (_key, mask) in export_sources.items()
+                    },
+                )
+                if available
+                else b""
+            ),
             file_name=(
                 f"{dataset_key}_{case.case_id}_tumor{tumor_index + 1}"
                 f"_surfaces{reduced_suffix}.zip"
@@ -608,5 +713,129 @@ def render_plan_tab(
             mime="application/zip",
             width="stretch",
             disabled=not available,
-            help="Build the 3D plan first. Files share RAS millimetre coordinates.",
+            help=(
+                "Build the 3D plan first. Unsmoothed reference surfaces from the voxel "
+                "labels, in shared RAS millimetre coordinates."
+            ),
         )
+
+
+def _review_store(patient_mode: bool) -> ReviewStore:
+    """Reviews persist on disk on private installs; on the public demo, per session only."""
+
+    configured = os.environ.get("RENAL_REVIEW_DIR")
+    if configured:
+        return ReviewStore(configured)
+    if patient_mode:
+        root = os.environ.get("RENAL_PATIENT_ROOT", "~/RenalPlanner/cases")
+        return ReviewStore(Path(root).expanduser().parent / "reviews")
+    if "review_store" not in st.session_state:
+        st.session_state["review_store"] = ReviewStore(None)
+    return st.session_state["review_store"]
+
+
+def _render_review_panel(review_key: str, case_label: str, qa: dict, patient_mode: bool):
+    store = _review_store(patient_mode)
+    record = store.load(review_key, case_label)
+    state = overall_state(qa["status"], record)
+    st.markdown("**Model review**")
+    message = f"{STATE_LABELS[state]}"
+    if state == ACCEPTED:
+        st.success(message)
+    elif state in (REJECTED, "failed", "incomplete"):
+        st.error(message)
+    elif state == REVIEWED:
+        st.info(message)
+    else:
+        st.warning(message)
+    qa_label = {
+        "pending": "not run: build the 3D plan",
+        "passed": "passed",
+        "failed": "failed",
+        "incomplete": "incomplete (missing evidence)",
+    }
+    with st.expander(f"Automated geometry QA: {qa_label[qa['status']]}", expanded=False):
+        st.caption(
+            "Technical checks on the reference surfaces only. Passing them does not mean the "
+            "anatomy is correct. Thresholds are engineering criteria."
+        )
+        if qa["checks"]:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Structure": item["structure"],
+                            "Check": item["check"],
+                            "Result": {True: "pass", False: "FAIL", None: "MISSING"}[
+                                item["passed"]
+                            ],
+                            "Value": item["detail"],
+                        }
+                        for item in qa["checks"]
+                    ]
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+        for warning in qa["warnings"]:
+            st.caption(warning)
+    with st.expander("Clinician review of this lesion and plan", expanded=False):
+        if not store.persistent:
+            st.caption("Online demo: reviews are kept for this browser session only.")
+        reviewer = st.text_input("Reviewer", value=record.reviewer, key=f"rv_name_{review_key}")
+        checks = {
+            key: st.checkbox(
+                label, value=record.checks.get(key, False), key=f"rv_{key}_{review_key}"
+            )
+            for key, label in REVIEW_CHECKS.items()
+        }
+        notes = st.text_area("Notes", value=record.notes, key=f"rv_notes_{review_key}")
+        limitations = st.text_area(
+            "Limitations (one per line)",
+            value="\n".join(record.limitations),
+            key=f"rv_lim_{review_key}",
+        )
+        actions = st.columns(4)
+        requested = None
+        if actions[0].button("Mark reviewed", key=f"rv_do_rev_{review_key}", width="stretch"):
+            requested = REVIEWED
+        if actions[1].button(
+            "Accept for research",
+            key=f"rv_do_acc_{review_key}",
+            width="stretch",
+            disabled=record.status != REVIEWED or qa["status"] != QA_PASSED,
+        ):
+            requested = ACCEPTED
+        if actions[2].button("Reject", key=f"rv_do_rej_{review_key}", width="stretch"):
+            requested = REJECTED
+        if actions[3].button(
+            "Reopen",
+            key=f"rv_do_reo_{review_key}",
+            width="stretch",
+            disabled=record.status == UNREVIEWED,
+        ):
+            requested = UNREVIEWED
+        if requested:
+            try:
+                transition(
+                    record,
+                    requested,
+                    reviewer=reviewer,
+                    qa_status=qa["status"],
+                    checks=checks,
+                    notes=notes,
+                    limitations=limitations.splitlines(),
+                )
+                store.save(record)
+                st.rerun()
+            except ReviewError as exc:
+                st.error(str(exc))
+        if record.history:
+            st.caption(
+                "History: "
+                + " · ".join(
+                    f"{item['from']}→{item['to']} by {item['reviewer']}"
+                    for item in record.history[-5:]
+                )
+            )
+    return record

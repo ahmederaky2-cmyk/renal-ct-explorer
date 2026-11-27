@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import re
 import zipfile
 from datetime import datetime, timezone
@@ -42,8 +43,15 @@ def stl_zip(
     meshes: dict[str, dict[str, Any]],
     readme: str = "",
     resolution: dict[str, Any] | None = None,
+    manifest: dict[str, Any] | None = None,
+    labelmaps: dict[str, tuple[Any, Any]] | None = None,
 ) -> bytes:
-    """Zip of one STL per structure. ``meshes`` maps display name -> mesh dict."""
+    """Zip of one STL per structure. ``meshes`` maps display name -> mesh dict.
+
+    ``manifest`` (see :mod:`renal_explorer.manifest`) is written as ``manifest.json``.
+    ``labelmaps`` maps name -> (binary mask, affine): the source masks the surfaces were
+    built from, written as NIfTI (RAS+) so meshes can be checked against them.
+    """
 
     if not readme:
         readme = (
@@ -67,7 +75,68 @@ def stl_zip(
                 f"{_safe_name(name)}.stl", stl_bytes(mesh["vertices"], mesh["faces"], name)
             )
         archive.writestr("README.txt", readme)
+        quality = {
+            name: {
+                key: mesh["quality"].get(key)
+                for key in (
+                    "role",
+                    "method",
+                    "source_volume_ml",
+                    "mesh_volume_ml",
+                    "volume_error_pct",
+                    "surface_to_mask_p95_mm",
+                    "target_spacing_mm",
+                    "watertight",
+                )
+            }
+            for name, mesh in meshes.items()
+            if mesh is not None and isinstance(mesh.get("quality"), dict)
+        }
+        if quality:
+            archive.writestr(
+                "mesh_quality.json", json.dumps(quality, indent=2, default=_json_value)
+            )
+        for name, (mask, affine) in (labelmaps or {}).items():
+            import nibabel as nib
+            import numpy as np
+
+            image = nib.Nifti1Image(np.asarray(mask, dtype=np.uint8), np.asarray(affine, float))
+            image.set_qform(np.asarray(affine, float), code=1)
+            image.set_sform(np.asarray(affine, float), code=1)
+            stem = "".join(ch if ch.isalnum() else "_" for ch in name).strip("_").lower()
+            archive.writestr(f"labelmaps/{stem}.nii", image.to_bytes())
+        if manifest is not None:
+            archive.writestr(
+                "manifest.json", json.dumps(manifest, indent=2, default=_json_value)
+            )
     return buffer.getvalue()
+
+
+def _json_value(value: Any) -> Any:
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    if hasattr(value, "item"):
+        return value.item()
+    return str(value)
+
+
+def _model_status_paragraphs(review, styles, mm, spacer, paragraph) -> list[Any]:
+    """Model state block: generation, automated QA and clinician review are separate."""
+
+    if not review:
+        return []
+    reviewer = review.get("reviewer")
+    lines = [
+        f"<b>Model status: {review.get('state_label', 'Generated: not verified')}</b>",
+        f"Automated geometry QA: {review.get('qa_status', 'pending')} "
+        "(technical checks only; says nothing about anatomical correctness).",
+        f"Clinician review: {review.get('clinician_status', 'unreviewed')}"
+        + (f" by {reviewer}" if reviewer else "")
+        + ".",
+    ]
+    if review.get("ct_sha256"):
+        lines.append(f"CT SHA-256: {review['ct_sha256'][:16]}…")
+    return [spacer(1, 2 * mm), paragraph("<br/>".join(lines), styles["Normal"])]
 
 
 def _fmt(value: Any, digits: int = 1, suffix: str = "") -> str:
@@ -182,6 +251,7 @@ def plan_report_pdf(
             if (summary.get("resolution") or {}).get("reduced")
             else []
         ),
+        *_model_status_paragraphs(summary.get("model_review"), styles, mm, Spacer, Paragraph),
         Spacer(1, 4 * mm),
         Paragraph("Nephrometry", styles["Heading2"]),
         table(
