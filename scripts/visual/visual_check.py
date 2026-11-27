@@ -120,7 +120,7 @@ def main() -> None:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(args=LAUNCH_ARGS)
         for case_id in args.cases:
-            context = browser.new_context(viewport={"width": 1440, "height": 1000})
+            context = browser.new_context(viewport={"width": 1440, "height": 4200})
             page = context.new_page()
             try:
                 results.append(capture_case(page, args.url, case_id, out, args.prefix))
@@ -132,7 +132,7 @@ def main() -> None:
             context.close()
         if args.mobile_case:
             context = browser.new_context(
-                viewport={"width": 390, "height": 844}, device_scale_factor=2, is_mobile=True
+                viewport={"width": 390, "height": 6000}, device_scale_factor=1.5, is_mobile=True
             )
             page = context.new_page()
             try:
