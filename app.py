@@ -349,6 +349,14 @@ def build_3d_figure(
     return figure
 
 
+def _query_index(options, parameter: str) -> int:
+    """Preselect from a URL parameter (?case=case_00015) for shareable links."""
+
+    wanted = st.query_params.get(parameter)
+    options = list(options)
+    return options.index(wanted) if wanted in options else 0
+
+
 def root_default(dataset_key: str) -> str:
     base = Path(os.environ.get("RENAL_DATA_ROOT", "/data"))
     return str(base / dataset_key)
@@ -442,6 +450,7 @@ def main() -> None:
             case_id = st.selectbox(
                 "Public case",
                 demo_case_ids(),
+                index=_query_index(demo_case_ids(), "case"),
                 format_func=demo_case_label,
             )
             dataset_root = str(
@@ -481,7 +490,9 @@ def main() -> None:
                     found_id: (image, segmentation)
                     for found_id, image, segmentation in cases
                 }
-                case_id = st.selectbox("Case", list(case_lookup))
+                case_id = st.selectbox(
+                    "Case", list(case_lookup), index=_query_index(list(case_lookup), "case")
+                )
                 image_path, segmentation_path = case_lookup[case_id]
 
         st.caption(f"License: {adapter.info.license_name}")
