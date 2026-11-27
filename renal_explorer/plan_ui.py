@@ -14,7 +14,7 @@ from .exports import plan_report_pdf, stl_zip
 from .labels import LABEL_COLORS, CanonicalLabel
 from .planning import PlanningError, assemble_plan, plan_geometry
 from .rendering import render_view
-from .three_d import surface_mesh
+from .three_d import REFERENCE_QUALITY, surface_mesh
 
 BRANCH_DEPTHS = {
     1: "Divisions (1st significant bifurcation)",
@@ -520,7 +520,7 @@ def render_plan_tab(
     st.markdown("**3D plan**")
     view_columns = st.columns(4)
     with view_columns[0]:
-        quality = st.selectbox("Plan detail", ("Fast", "Balanced", "Detailed"), index=0)
+        quality = st.selectbox("Plan detail", ("Fast", "Balanced", "Detailed"), index=1)
     with view_columns[1]:
         show_territories = st.checkbox(
             "Colour territories", value=bool(territories), disabled=not territories
@@ -535,6 +535,7 @@ def render_plan_tab(
     if st.button("Build 3D plan", key=f"button_{build_key}", width="stretch"):
         st.session_state[build_key] = True
     meshes: dict[str, dict[str, Any] | None] = {}
+    export_sources: dict[str, tuple[str, np.ndarray]] = {}
     if st.session_state.get(build_key, False):
         sources = {
             "Kidney": display["kidney"],
@@ -550,6 +551,7 @@ def render_plan_tab(
                 meshes[name] = cached_plan_mesh(
                     key, name, quality, mask, display["affine"], display["spacing"]
                 )
+                export_sources[name] = (key, mask)
         st.plotly_chart(
             build_plan_figure(meshes, plan, show_territories, show_distances),
             config={"displaylogo": False, "scrollZoom": True},
@@ -597,7 +599,14 @@ def render_plan_tab(
             width="stretch",
         )
     with downloads[2]:
-        available = {name: mesh for name, mesh in meshes.items() if mesh is not None}
+        # Exports use the unsmoothed reference surfaces, never the display previews.
+        available = {
+            name: cached_plan_mesh(
+                key, name, REFERENCE_QUALITY, mask, display["affine"], display["spacing"]
+            )
+            for name, (key, mask) in export_sources.items()
+        }
+        available = {name: mesh for name, mesh in available.items() if mesh is not None}
         st.download_button(
             "3D surfaces (STL zip)",
             data=stl_zip(available, resolution=summary["resolution"]) if available else b"",
@@ -608,5 +617,8 @@ def render_plan_tab(
             mime="application/zip",
             width="stretch",
             disabled=not available,
-            help="Build the 3D plan first. Files share RAS millimetre coordinates.",
+            help=(
+                "Build the 3D plan first. Unsmoothed reference surfaces from the voxel "
+                "labels, in shared RAS millimetre coordinates."
+            ),
         )
