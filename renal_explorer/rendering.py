@@ -183,6 +183,8 @@ def draw_orientation_markers(rgb: np.ndarray, orientation: str) -> np.ndarray:
 
     from PIL import Image, ImageDraw, ImageFont
 
+    if min(rgb.shape[:2]) < 96:  # too small for legible letters (thumbnails, tests)
+        return rgb
     left, right, top, bottom = ORIENTATION_MARKERS[orientation]
     image = Image.fromarray(rgb)
     draw = ImageDraw.Draw(image)

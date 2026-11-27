@@ -81,8 +81,8 @@ def test_crosshair_passes_through_the_selected_point() -> None:
 
 def test_orientation_markers_are_drawn() -> None:
     image, segmentation = _volume_with_right_sided_mass()
-    plain = _render("Axial", 15, np.zeros((120, 120, 20), np.float32), None)
-    marked = _render("Axial", 15, np.zeros((120, 120, 20), np.float32), None, markers=True)
+    plain = _render("Axial", 15, np.zeros((160, 160, 20), np.float32), None)
+    marked = _render("Axial", 15, np.zeros((160, 160, 20), np.float32), None, markers=True)
     assert plain.shape == marked.shape
     assert np.any(np.all(marked == (255, 214, 64), axis=2))
 
