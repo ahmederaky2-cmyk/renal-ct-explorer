@@ -109,6 +109,9 @@ This is usually the easier conversation with a data-protection officer.
 - Streamlit listens on `127.0.0.1` only; access goes through the tunnel and its login.
 - Turn on **FileVault** (full-disk encryption) on the Mac.
 - Keep the mapping between `PN-` IDs and patients outside this system, or don't keep one.
+- Clinician reviews are stored in `~/RenalPlanner/reviews` (`chmod 700`). They hold the
+  reviewer's name, checks and notes, keyed by content hashes; they are not deleted with the
+  case, so keep patient details out of review notes.
 
 What still needs institutional sign-off: processing patient data on a personal device, any
 third-party tunnel (Cloudflare decrypts traffic at its edge; Tailscale does not), and
@@ -136,6 +139,7 @@ but body habitus can be distinctive).
 | `RENAL_CS_THRESHOLD_HU` | `400` | Excretory-phase urine threshold |
 | `RENAL_RETENTION_DAYS` | `30` | Automatic deletion; `0` disables |
 | `RENAL_BIND_ADDRESS` | `127.0.0.1` | `0.0.0.0` to also allow direct LAN access |
+| `RENAL_REVIEW_DIR` | `~/RenalPlanner/reviews` | Clinician review records (one JSON per exact CT + labels) |
 
 ## 7. Train your own collecting-system model
 

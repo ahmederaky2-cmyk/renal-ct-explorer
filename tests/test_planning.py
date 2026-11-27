@@ -458,6 +458,13 @@ def test_demo_resolution_is_marked_in_pdf_and_stl() -> None:
         "full_spacing_mm": [0.78, 0.78, 0.5],
     }
     assert plan_report_pdf(summary, "demo").startswith(b"%PDF")
+    summary["model_review"] = {
+        "state_label": "Generated: not anatomically verified",
+        "qa_status": "pending",
+        "clinician_status": "unreviewed",
+        "ct_sha256": "a" * 64,
+    }
+    assert plan_report_pdf(summary, "demo").startswith(b"%PDF")
     mesh = {"vertices": np.eye(3), "faces": np.array([[0, 1, 2]])}
     payload = stl_zip({"Tumor": mesh}, resolution=summary["resolution"])
     archive = zipfile.ZipFile(io.BytesIO(payload))
