@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
+from scipy import ndimage as ndi
 
 from renal_explorer.labels import CanonicalLabel
 from renal_explorer.planning import (
@@ -89,6 +92,50 @@ def test_gap_is_zero_for_face_neighbours_on_anisotropic_grid() -> None:
     assert _gap_mm((0, 0, 0), (0, 0, 3), (0.8, 0.8, 3.0)) == pytest.approx(6.0)
 
 
+def test_gap_is_exact_box_distance_on_thick_slices() -> None:
+    # External review case: 1 x 1 x 5 mm cells offset by (6, 0, 1) indices are 5.00 mm
+    # apart (adjacent slices touch); the old projection formula gave 3.84 mm (N=3).
+    assert _gap_mm((0, 0, 0), (6, 0, 1), (1.0, 1.0, 5.0)) == pytest.approx(5.0)
+    assert _gap_mm((0, 0, 0), (1, 1, 1), (0.8, 0.8, 3.0)) == pytest.approx(0.0)  # corner
+    assert _gap_mm((0, 0, 0), (3, 4, 0), (1.0, 1.0, 5.0)) == pytest.approx(math.hypot(2, 3))
+
+
+def _unit_with(tumor: np.ndarray, spacing):
+    from renal_explorer.planning import RenalUnit
+
+    unit = RenalUnit.__new__(RenalUnit)
+    unit.tumor = tumor
+    unit.spacing = tuple(spacing)
+    unit.affine = np.diag([*spacing, 1.0])
+    touching = ndi.binary_dilation(tumor, structure=np.ones((3, 3, 3), bool))
+    gap, nearest = ndi.distance_transform_edt(~touching, sampling=spacing, return_indices=True)
+    unit.tumor_box_gap = gap.astype(np.float32)
+    unit.tumor_box_nearest = nearest
+    return unit
+
+
+def test_nearest_structure_matches_brute_force_and_returns_surface_endpoints() -> None:
+    from renal_explorer.planning import _nearest_to_tumor
+
+    rng = np.random.default_rng(3)
+    spacing = (0.8, 0.8, 5.0)
+    for _ in range(6):
+        tumor = np.zeros((24, 24, 10), bool)
+        tumor[8:14, 9:15, 3:6] = True
+        target = rng.random(tumor.shape) > 0.995
+        target &= ~tumor
+        if not target.any():
+            continue
+        result = _nearest_to_tumor(_unit_with(tumor, spacing), target)
+        tumor_cells, target_cells = np.argwhere(tumor), np.argwhere(target)
+        brute = min(_gap_mm(a, b, spacing) for a in tumor_cells for b in target_cells)
+        assert result["gap_mm"] == pytest.approx(brute, abs=1e-4)
+        endpoint_distance = np.linalg.norm(
+            np.subtract(result["tumor_point_mm"], result["target_point_mm"])
+        )
+        assert endpoint_distance == pytest.approx(result["gap_mm"], abs=1e-4)
+
+
 def test_closing_fills_narrow_notch_and_keeps_mask() -> None:
     mask = np.zeros((40, 40, 40), dtype=bool)
     mask[5:35, 5:35, 5:35] = True
@@ -137,7 +184,12 @@ def test_central_endophytic_tumor_is_high_complexity() -> None:
     assert renal["N_estimate"] == 3
     assert renal["L"] == 3
     assert renal["total_estimate"] >= 10
-    assert renal["total_max"] >= 10 and "est." in renal["score"]
+    assert renal["total_max"] >= 10
+    # A proxy-based estimate is kept in the JSON but never shown as the headline score.
+    assert "est." not in renal["score"]
+    resection = plan["summary"]["resection"]
+    assert "Renal sinus" in resection["indeterminate"]
+    assert all(item["structure"] != "Renal sinus" for item in resection["warnings"])
     assert plan["summary"]["resection"]["removed_parenchyma_ml"] == 0.0
     assert plan["summary"]["scores"]["padua"]["total_max"] > plan["summary"]["scores"][
         "padua"

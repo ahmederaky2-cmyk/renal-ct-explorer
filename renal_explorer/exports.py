@@ -94,7 +94,7 @@ def _fmt_list(values) -> str:
 def _n_range(renal: dict[str, Any]) -> str:
     low, high = renal.get("N_range") or (1, 3)
     estimate = renal.get("N_estimate")
-    return f"{low}-{high}" + (f" (est. {estimate}, {renal.get('N_source')})" if estimate else "")
+    return f"{low}-{high}" + (f" (proxy suggests {estimate})" if estimate else "")
 
 
 def plan_report_pdf(
@@ -236,7 +236,7 @@ def plan_report_pdf(
         Paragraph("Resection simulation", styles["Heading2"]),
         table(
             [
-                ["Technique", "Tumour", "Parenchyma removed", "Ipsilateral kept", "Total kept"],
+                ["Technique", "Tumour", "Kidney tissue removed", "Ipsilateral kept", "Total kept"],
                 [
                     resection["technique"],
                     _fmt(resection["tumor_ml"], 1, " mL"),
