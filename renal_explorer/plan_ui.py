@@ -229,7 +229,9 @@ def _score_tables(summary: dict[str, Any]) -> None:
     if renal_n["N"] is None:
         low, high = renal_n["N_range"]
         estimate = renal_n.get("N_estimate")
-        n_text = f"{low}–{high}" + (f" (est. {estimate})" if estimate is not None else "")
+        n_text = f"{low}–{high}" + (
+            f" (proxy suggests {estimate})" if estimate is not None else ""
+        )
     else:
         n_text = str(renal_n["N"])
     left, right = st.columns(2)
@@ -399,7 +401,7 @@ def render_plan_tab(
         "Tumour", f"{scores['max_diameter_mm'] / 10:.1f} cm", scores["location"], delta_color="off"
     )
     cards[3].metric(
-        "Parenchyma kept",
+        "Kidney tissue kept",
         f"{resection['preserved_ipsilateral_pct']:.1f} %",
         f"{summary['side']} kidney · {resection['technique'].lower()}",
         delta_color="off",
@@ -409,6 +411,11 @@ def render_plan_tab(
         st.warning(
             f"{warning['structure']} is {warning['gap_mm']:.1f} mm from the tumour "
             f"({warning['level']})."
+        )
+    for name in resection.get("indeterminate", []):
+        st.info(
+            f"{name} relationship indeterminate: no reviewed outline. Check it on the CT; "
+            "the experimental proxy distance is listed under the tables."
         )
 
     _score_tables(summary)
@@ -423,7 +430,11 @@ def render_plan_tab(
                         {
                             "Structure": name,
                             "Gap (mm)": round(item["gap_mm"], 1),
-                            "Source": item["source"],
+                            "Source": (
+                                "experimental proxy (unreviewed)"
+                                if item["source"] == "proxy"
+                                else item["source"]
+                            ),
                         }
                         for name, item in summary["distances"].items()
                     ]
@@ -431,6 +442,7 @@ def render_plan_tab(
                 hide_index=True,
                 width="stretch",
             )
+        st.caption("Minimum gap between voxel-box surfaces of the two label masks.")
         contact = summary["contact_surface"]
         st.caption(
             f"Tumour–parenchyma contact surface: {contact['contact_cm2']:.1f} cm² of "
@@ -441,10 +453,10 @@ def render_plan_tab(
         rows = [
             ("Technique", resection["technique"]),
             ("Tumour volume", f"{resection['tumor_ml']:.1f} mL"),
-            ("Parenchyma removed", f"{resection['removed_parenchyma_ml']:.1f} mL"),
-            ("Ipsilateral parenchyma kept", f"{resection['preserved_ipsilateral_pct']:.1f} %"),
+            ("Kidney-labelled tissue removed", f"{resection['removed_parenchyma_ml']:.1f} mL"),
+            ("Ipsilateral kidney tissue kept", f"{resection['preserved_ipsilateral_pct']:.1f} %"),
             (
-                "Total parenchyma kept",
+                "Total kidney tissue kept",
                 f"{resection['preserved_total_pct']:.1f} %"
                 if resection["preserved_total_pct"] is not None
                 else f"not shown: opposite kidney {resection['contralateral_status']}",

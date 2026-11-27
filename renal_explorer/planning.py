@@ -85,6 +85,10 @@ class RenalUnit:
     sinus_source: str = field(init=False, default="unavailable")
     tumor_distance: np.ndarray = field(init=False)
     tumor_nearest: np.ndarray | None = field(init=False)
+    # Exact box-to-box gap from the tumour cells (0 for touching cells) and the nearest
+    # cell of the 27-neighbourhood dilation used to compute it.
+    tumor_box_gap: np.ndarray | None = field(init=False, default=None)
+    tumor_box_nearest: np.ndarray | None = field(init=False, default=None)
     axes: dict[str, np.ndarray] = field(init=False)
     center: np.ndarray = field(init=False)
 
@@ -142,14 +146,24 @@ def _fill_holes(mask: np.ndarray) -> np.ndarray:
 
 
 def _gap_mm(first: np.ndarray, second: np.ndarray, spacing) -> float:
-    """Approximate surface gap between two voxel centres (centre distance − voxel extent)."""
+    """Exact gap (mm) between two voxel cells treated as boxes.
 
-    vector = (np.asarray(first, float) - np.asarray(second, float)) * np.asarray(spacing, float)
-    distance = float(np.linalg.norm(vector))
-    if distance == 0.0:
-        return 0.0
-    extent = float(np.sum(np.abs(vector / distance) * np.asarray(spacing, float)))
-    return max(0.0, distance - extent)
+    Along each axis, cells ``d`` indices apart are ``max(|d| - 1, 0) * spacing`` apart;
+    face, edge and corner neighbours touch (0 mm).
+    """
+
+    steps = np.maximum(np.abs(np.asarray(first, float) - np.asarray(second, float)) - 1.0, 0.0)
+    return float(np.linalg.norm(steps * np.asarray(spacing, float)))
+
+
+def _box_endpoints(tumor_voxel, target_voxel) -> tuple[np.ndarray, np.ndarray]:
+    """Closest points (voxel coordinates) between two voxel boxes."""
+
+    tumor_voxel = np.asarray(tumor_voxel, float)
+    target_voxel = np.asarray(target_voxel, float)
+    on_tumor = np.clip(target_voxel, tumor_voxel - 0.5, tumor_voxel + 0.5)
+    on_target = np.clip(on_tumor, target_voxel - 0.5, target_voxel + 0.5)
+    return on_tumor, on_target
 
 
 def _risk(total: int, table) -> str:
@@ -432,6 +446,13 @@ def _derive_geometry(unit: RenalUnit) -> None:
     unit.tumor_distance = distance.astype(np.float32)
     unit.tumor_nearest = nearest
     del distance
+    # Gap between voxel *boxes*: a cell is max(|d|-1, 0) steps from the tumour along
+    # each axis, i.e. the centre distance to the tumour dilated by its 26 neighbours.
+    touching = ndi.binary_dilation(unit.tumor, structure=np.ones((3, 3, 3), bool))
+    box_gap, box_nearest = _edt(~touching, spacing, return_indices=True)
+    unit.tumor_box_gap = box_gap.astype(np.float32)
+    unit.tumor_box_nearest = box_nearest
+    del box_gap
 
     renal_points = unit.world(_sample(np.argwhere(unit.kidney | unit.tumor)))
     unit.center, unit.axes = _principal_axes(renal_points)
@@ -447,20 +468,44 @@ def _derive_geometry(unit: RenalUnit) -> None:
 
 
 def _nearest_to_tumor(unit: RenalUnit, target: np.ndarray) -> dict[str, Any] | None:
+    """Minimum surface gap between the tumour and ``target`` cells, with endpoints.
+
+    Exact for voxel boxes on an anisotropic grid; the endpoints are the closest points
+    on the two box surfaces (in world mm), not voxel centres.
+    """
+
     if target is None or not target.any():
         return None
-    distances = np.where(target, unit.tumor_distance, np.inf)
-    flat = int(np.argmin(distances))
-    target_voxel = np.array(np.unravel_index(flat, target.shape))
-    tumor_voxel = unit.tumor_nearest[(slice(None), *target_voxel)]
+    gaps = np.where(target, unit.tumor_box_gap, np.inf)
+    target_voxel = np.array(np.unravel_index(int(np.argmin(gaps)), target.shape))
     if unit.tumor[tuple(target_voxel)]:
-        gap = 0.0
+        tumor_voxel = target_voxel
     else:
-        gap = _gap_mm(tumor_voxel, target_voxel, unit.spacing)
+        # The tumour cell is within one step of the nearest dilated cell (or of the
+        # target itself when they touch); pick the one with the smallest exact gap.
+        anchor = (
+            target_voxel
+            if unit.tumor_box_gap[tuple(target_voxel)] == 0
+            else unit.tumor_box_nearest[(slice(None), *target_voxel)]
+        )
+        best = None
+        for offset in np.ndindex(3, 3, 3):
+            candidate = np.asarray(anchor) + np.asarray(offset) - 1
+            if np.any(candidate < 0) or np.any(candidate >= np.asarray(unit.tumor.shape)):
+                continue
+            if not unit.tumor[tuple(candidate)]:
+                continue
+            gap = _gap_mm(candidate, target_voxel, unit.spacing)
+            if best is None or gap < best[0]:
+                best = (gap, candidate)
+        tumor_voxel = best[1] if best is not None else anchor
+    gap = _gap_mm(tumor_voxel, target_voxel, unit.spacing)
+    on_tumor, on_target = _box_endpoints(tumor_voxel, target_voxel)
     return {
         "gap_mm": float(gap),
-        "tumor_point_mm": unit.world(tumor_voxel)[0].tolist(),
-        "target_point_mm": unit.world(target_voxel)[0].tolist(),
+        "measure": "minimum gap between voxel-box surfaces",
+        "tumor_point_mm": unit.world(on_tumor)[0].tolist(),
+        "target_point_mm": unit.world(on_target)[0].tolist(),
     }
 
 
@@ -649,9 +694,9 @@ def nephrometry(unit: RenalUnit, distances: dict[str, Any]) -> dict[str, Any]:
     if renal_total_min == renal_total_max:
         renal_string = f"{renal_total_min}{suffix}"
     else:
+        # No single "estimated" total in the headline: an unreviewed proxy must not look
+        # like an observed score. The estimate stays in the JSON as total_estimate.
         renal_string = f"{renal_total_min}–{renal_total_max}{suffix}"
-        if renal_total_estimate is not None:
-            renal_string += f" (est. {renal_total_estimate})"
 
     # --- PADUA
     middle = _projections(unit, unit.tumor, "middle")
@@ -756,7 +801,13 @@ def simulate_resection(
     total_before = ipsilateral + contralateral
     total_after = preserved + contralateral
     warnings = []
+    indeterminate = []
     for name, item in distances.items():
+        if item.get("source") == "proxy":
+            # A proxy contact is not an observed contact: report the relationship as
+            # indeterminate instead of a headline distance.
+            indeterminate.append(name)
+            continue
         gap = item["gap_mm"]
         if gap <= margin_mm:
             warnings.append(
@@ -786,6 +837,7 @@ def simulate_resection(
             100.0 * preserved / total_after if contralateral and total_after else None
         ),
         "warnings": warnings,
+        "indeterminate": indeterminate,
         "mask": resected_parenchyma,
     }
 
@@ -1060,6 +1112,8 @@ def plan_geometry(
     }
     # Release large intermediates that later (cached) steps do not need.
     unit.tumor_nearest = None
+    unit.tumor_box_nearest = None
+    unit.tumor_box_gap = None
     unit.image = None
     return geometry
 
