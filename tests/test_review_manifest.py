@@ -65,7 +65,8 @@ def test_acceptance_needs_review_all_checks_and_passed_qa() -> None:
     with pytest.raises(ReviewError):
         transition(record, REVIEWED, reviewer="  ", qa_status=QA_PASSED, checks=ALL_CHECKS)
     transition(record, REVIEWED, reviewer="Dr A", qa_status=QA_FAILED, checks=ALL_CHECKS)
-    assert overall_state(QA_FAILED, record) == REVIEWED
+    assert overall_state(QA_FAILED, record) == QA_FAILED
+    assert overall_state(QA_PASSED, record) == REVIEWED
     with pytest.raises(ReviewError, match="QA"):
         transition(record, ACCEPTED, reviewer="Dr A", qa_status=QA_FAILED, checks=ALL_CHECKS)
     partial = {**ALL_CHECKS, "vessels": False}
@@ -73,8 +74,8 @@ def test_acceptance_needs_review_all_checks_and_passed_qa() -> None:
         transition(record, ACCEPTED, reviewer="Dr A", qa_status=QA_PASSED, checks=partial)
     transition(record, ACCEPTED, reviewer="Dr A", qa_status=QA_PASSED, checks=ALL_CHECKS)
     assert overall_state(QA_PASSED, record) == ACCEPTED
-    # Acceptance does not survive a later QA failure.
-    assert overall_state(QA_FAILED, record) == REVIEWED
+    # A later QA failure is always shown over the acceptance.
+    assert overall_state(QA_FAILED, record) == QA_FAILED
     assert [item["to"] for item in record.history] == [REVIEWED, ACCEPTED]
 
 
@@ -170,3 +171,56 @@ def test_stl_zip_and_pdf_carry_manifest_and_status() -> None:
     archive = zipfile.ZipFile(io.BytesIO(payload))
     assert json.loads(archive.read("manifest.json"))["case_id"] == "case_00001"
     assert "mesh_quality.json" in archive.namelist()
+
+
+def test_stl_zip_includes_source_labelmaps() -> None:
+    nib = pytest.importorskip("nibabel")
+    if not hasattr(nib, "Nifti1Image"):
+        pytest.skip("nibabel stub without NIfTI support")
+    mask = np.zeros((4, 4, 4), np.uint8)
+    mask[1:3, 1:3, 1:3] = 1
+    affine = np.diag([0.8, 0.8, 3.0, 1.0])
+    payload = stl_zip({"Tumor": _cube_mesh()}, labelmaps={"Tumor": (mask, affine)})
+    archive = zipfile.ZipFile(io.BytesIO(payload))
+    assert "labelmaps/tumor.nii" in archive.namelist()
+    image = nib.Nifti1Image.from_bytes(archive.read("labelmaps/tumor.nii"))
+    assert np.allclose(image.affine, affine)
+    assert int(np.asarray(image.dataobj).sum()) == 8
+
+
+def test_missing_evidence_makes_qa_incomplete_not_passed() -> None:
+    from renal_explorer.review import QA_INCOMPLETE
+
+    spacing = (1.0, 1.0, 3.0)
+    bare = _cube_mesh()
+    bare["quality"] = {}
+    assert automated_qa({"Kidney": bare}, spacing)["status"] == QA_INCOMPLETE
+    partial = _cube_mesh()
+    del partial["quality"]["surface_to_mask_p95_mm"]
+    assert automated_qa({"Kidney": partial}, spacing)["status"] == QA_INCOMPLETE
+    # An expected structure without a mesh fails.
+    result = automated_qa({"Kidney": _cube_mesh()}, spacing, expected=("Kidney", "Tumor"))
+    assert result["status"] == QA_FAILED
+    record = ReviewRecord(case_key="abc")
+    transition(record, REVIEWED, reviewer="Dr A", qa_status=QA_PASSED, checks=ALL_CHECKS)
+    with pytest.raises(ReviewError, match="QA"):
+        transition(record, ACCEPTED, reviewer="Dr A", qa_status=QA_INCOMPLETE, checks=ALL_CHECKS)
+    assert overall_state(QA_INCOMPLETE, record) == QA_INCOMPLETE
+
+
+def test_review_does_not_carry_over_to_another_lesion_or_margin() -> None:
+    from renal_explorer.review import lesion_review_key
+
+    base = lesion_review_key("ct", "seg", (-120.2, 40.0, 10.4), 3.0, 1)
+    assert base == lesion_review_key("ct", "seg", (-120.4, 40.1, 10.2), 3.0, 1)
+    assert base != lesion_review_key("ct", "seg", (60.0, 40.0, 10.0), 3.0, 1)  # tumour 2
+    assert base != lesion_review_key("ct", "seg", (-120.2, 40.0, 10.4), 5.0, 1)  # margin
+    assert base != lesion_review_key("ct", "seg", (-120.2, 40.0, 10.4), 3.0, 2)  # depth
+    assert base != lesion_review_key("ct", "seg-edited", (-120.2, 40.0, 10.4), 3.0, 1)
+    store = ReviewStore(None)
+    record = store.load(base)
+    transition(record, REVIEWED, reviewer="Dr A", qa_status=QA_PASSED, checks=ALL_CHECKS)
+    transition(record, ACCEPTED, reviewer="Dr A", qa_status=QA_PASSED, checks=ALL_CHECKS)
+    store.save(record)
+    other = lesion_review_key("ct", "seg", (60.0, 40.0, 10.0), 3.0, 1)
+    assert store.load(other).status == UNREVIEWED

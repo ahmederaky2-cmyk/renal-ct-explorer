@@ -28,8 +28,8 @@ from .review import (
     ReviewError,
     ReviewStore,
     automated_qa,
+    lesion_review_key,
     overall_state,
-    review_case_key,
     transition,
 )
 from .three_d import REFERENCE_QUALITY, surface_mesh
@@ -587,9 +587,19 @@ def render_plan_tab(
     }
     case_label = f"{adapter.info.name} {case.case_id}"
     qa = automated_qa(
-        reference_meshes, display["spacing"], bool(summary["resolution"]["reduced"])
+        reference_meshes,
+        display["spacing"],
+        bool(summary["resolution"]["reduced"]),
+        expected=tuple(export_sources),
     )
-    review_key = review_case_key(ct_digest, segmentation_token)
+    # One review per lesion *and* plan settings: switching tumour or margin starts afresh.
+    review_key = lesion_review_key(
+        ct_digest,
+        segmentation_token,
+        summary["tumor_center_mm"],
+        float(margin_mm),
+        int(branch_depth),
+    )
     record = _render_review_panel(review_key, case_label, qa, patient_provenance is not None)
     state = overall_state(qa["status"], record)
     summary["model_review"] = {
@@ -614,6 +624,13 @@ def render_plan_tab(
             "algorithm": "Label masks -> signed distance -> Lewiner marching cubes",
             "exported_surfaces": "reference (native planning grid, no smoothing/decimation)",
             "planning_grid_spacing_mm": [float(value) for value in display["spacing"]],
+            "planning_grid_affine": np.asarray(display["affine"], float).round(6).tolist(),
+            "planning_grid_shape": [int(value) for value in display["tumor"].shape],
+            # The planning grid is a crop (and, for large volumes, a stride) of the
+            # loaded case grid; the loaded grid may itself be a demo reduction.
+            "planning_grid_crop_start": [int(value) for value in display["crop_start"]],
+            "planning_grid_stride": [int(value) for value in np.atleast_1d(display["stride"])],
+            "source_labelmaps": "labelmaps/*.nii in the STL zip (planning grid, RAS+)",
             "display_detail": quality,
             "parameters": {
                 "tumor_index": int(tumor_index),
@@ -677,7 +694,15 @@ def render_plan_tab(
         st.download_button(
             "3D surfaces (STL zip)",
             data=(
-                stl_zip(available, resolution=summary["resolution"], manifest=manifest)
+                stl_zip(
+                    available,
+                    resolution=summary["resolution"],
+                    manifest=manifest,
+                    labelmaps={
+                        name: (mask, display["affine"])
+                        for name, (_key, mask) in export_sources.items()
+                    },
+                )
                 if available
                 else b""
             ),
@@ -717,13 +742,18 @@ def _render_review_panel(review_key: str, case_label: str, qa: dict, patient_mod
     message = f"{STATE_LABELS[state]}"
     if state == ACCEPTED:
         st.success(message)
-    elif state in (REJECTED, "failed"):
+    elif state in (REJECTED, "failed", "incomplete"):
         st.error(message)
     elif state == REVIEWED:
         st.info(message)
     else:
         st.warning(message)
-    qa_label = {"pending": "not run: build the 3D plan", "passed": "passed", "failed": "failed"}
+    qa_label = {
+        "pending": "not run: build the 3D plan",
+        "passed": "passed",
+        "failed": "failed",
+        "incomplete": "incomplete (missing evidence)",
+    }
     with st.expander(f"Automated geometry QA: {qa_label[qa['status']]}", expanded=False):
         st.caption(
             "Technical checks on the reference surfaces only. Passing them does not mean the "
@@ -736,7 +766,9 @@ def _render_review_panel(review_key: str, case_label: str, qa: dict, patient_mod
                         {
                             "Structure": item["structure"],
                             "Check": item["check"],
-                            "Result": "pass" if item["passed"] else "FAIL",
+                            "Result": {True: "pass", False: "FAIL", None: "MISSING"}[
+                                item["passed"]
+                            ],
                             "Value": item["detail"],
                         }
                         for item in qa["checks"]
@@ -747,7 +779,7 @@ def _render_review_panel(review_key: str, case_label: str, qa: dict, patient_mod
             )
         for warning in qa["warnings"]:
             st.caption(warning)
-    with st.expander("Clinician review", expanded=record.status == UNREVIEWED):
+    with st.expander("Clinician review of this lesion and plan", expanded=False):
         if not store.persistent:
             st.caption("Online demo: reviews are kept for this browser session only.")
         reviewer = st.text_input("Reviewer", value=record.reviewer, key=f"rv_name_{review_key}")

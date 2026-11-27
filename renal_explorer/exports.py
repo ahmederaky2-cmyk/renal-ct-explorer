@@ -44,10 +44,13 @@ def stl_zip(
     readme: str = "",
     resolution: dict[str, Any] | None = None,
     manifest: dict[str, Any] | None = None,
+    labelmaps: dict[str, tuple[Any, Any]] | None = None,
 ) -> bytes:
     """Zip of one STL per structure. ``meshes`` maps display name -> mesh dict.
 
     ``manifest`` (see :mod:`renal_explorer.manifest`) is written as ``manifest.json``.
+    ``labelmaps`` maps name -> (binary mask, affine): the source masks the surfaces were
+    built from, written as NIfTI (RAS+) so meshes can be checked against them.
     """
 
     if not readme:
@@ -93,6 +96,15 @@ def stl_zip(
             archive.writestr(
                 "mesh_quality.json", json.dumps(quality, indent=2, default=_json_value)
             )
+        for name, (mask, affine) in (labelmaps or {}).items():
+            import nibabel as nib
+            import numpy as np
+
+            image = nib.Nifti1Image(np.asarray(mask, dtype=np.uint8), np.asarray(affine, float))
+            image.set_qform(np.asarray(affine, float), code=1)
+            image.set_sform(np.asarray(affine, float), code=1)
+            stem = "".join(ch if ch.isalnum() else "_" for ch in name).strip("_").lower()
+            archive.writestr(f"labelmaps/{stem}.nii", image.to_bytes())
         if manifest is not None:
             archive.writestr(
                 "manifest.json", json.dumps(manifest, indent=2, default=_json_value)

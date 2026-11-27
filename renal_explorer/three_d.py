@@ -5,7 +5,6 @@ from typing import Any
 
 import numpy as np
 from scipy import ndimage as ndi
-from scipy.spatial import cKDTree
 from skimage.filters import frangi, sato
 from skimage.measure import marching_cubes
 from skimage.morphology import remove_small_objects, skeletonize
@@ -45,13 +44,6 @@ SURFACE_PROFILES = {
 # the coarsest voxel, the height of a terrace. Volume stays calibrated by the iso-level.
 DISPLAY_SDF_SIGMA_VOXELS = 0.6
 DISPLAY_MAX_DISPLACEMENT_FRACTION = 0.5
-
-# Vessel candidate reach. Sigmas up to ~5 mm capture the main renal vein; the aorta and
-# IVC (radius 8-15 mm) are found by a separate thick-tube detector or taken from labels.
-VESSEL_SIGMAS_MM = (0.8, 1.2, 1.8, 2.6, 3.5, 4.8)
-VESSEL_CORRIDOR_SLACK_MM = 25.0
-VESSEL_MAX_GAP_MM = 7.0
-GREAT_VESSEL_MIDLINE_MM = 50.0
 
 VESSEL_THRESHOLDS = {
     "Strict": (99.6, 99.0),
@@ -382,9 +374,7 @@ def _surface_from_binary_mask(
     target_spacing_mm = float(profile["target_spacing_mm"])
     spacing_array = np.asarray(spacing, dtype=float)
     source_volume_mm3 = float(np.count_nonzero(mask) * np.prod(spacing_array))
-    if reference:
-        target_spacing_mm = float(np.min(spacing_array))
-    elif source_volume_mm3 < 5_000.0:
+    if not reference and source_volume_mm3 < 5_000.0:
         small_structure_spacing = {
             "Fast": 1.0,
             "Balanced": 0.75,
@@ -409,10 +399,35 @@ def _surface_from_binary_mask(
         sampling=tuple(spacing_array),
     ) - ndi.distance_transform_edt(~cropped, sampling=tuple(spacing_array))
     mask_distance = signed_distance
-    if not reference:
-        signed_distance = ndi.gaussian_filter(
-            signed_distance, sigma=DISPLAY_SDF_SIGMA_VOXELS, mode="nearest"
+    if reference:
+        # Fixed, documented rule (no search, resampling, smoothing or decimation):
+        # Lewiner marching cubes at level 0 of the native-grid signed distance.
+        vertices, faces, _normals, _values = marching_cubes(
+            signed_distance.astype(np.float32),
+            level=0.0,
+            step_size=1,
+            allow_degenerate=False,
+            method="lewiner",
         )
+        raw_world = _voxel_to_world(vertices + origin, affine)
+        surface_to_mask = _surface_to_mask_p95(raw_world, mask_distance, affine, origin)
+        return (
+            raw_world.astype(np.float32),
+            faces.astype(np.int32),
+            source_volume_mm3,
+            0.0,
+            signed_distance,
+            origin,
+            np.ones(3),
+            float(np.min(spacing_array)),
+            0.0,
+            surface_to_mask,
+        )
+    # Display preview only. Blur scale in mm per axis (sigma_voxels x spacing), so a
+    # 5 mm slice axis is smoothed over about 3 mm and a 0.8 mm axis over about 0.5 mm.
+    signed_distance = ndi.gaussian_filter(
+        signed_distance, sigma=DISPLAY_SDF_SIGMA_VOXELS, mode="nearest"
+    )
     output_shape = _output_shape_for_spacing(
         signed_distance.shape,
         spacing_array,
@@ -432,20 +447,6 @@ def _surface_from_binary_mask(
         target_spacing_mm,
     )
 
-    if reference:
-        surface_to_mask = _surface_to_mask_p95(raw_world, mask_distance, affine, origin)
-        return (
-            raw_world.astype(np.float32),
-            faces.astype(np.int32),
-            source_volume_mm3,
-            0.0,
-            isotropic_distance,
-            origin,
-            input_per_output,
-            target_spacing_mm,
-            iso_level,
-            surface_to_mask,
-        )
     smoothed_world = _windowed_sinc_smooth(
         raw_world,
         faces,
@@ -603,7 +604,8 @@ def surface_mesh(
             smoothing_p95,
             target_spacing_mm,
             (
-                "Reference: native-grid signed distance + Lewiner, unsmoothed"
+                "Reference: Lewiner marching cubes at level 0 of the native-grid signed "
+                "distance; no resampling, calibration, smoothing or decimation"
                 if quality == REFERENCE_QUALITY
                 else "Display preview: blurred signed distance + Lewiner + VTK windowed sinc"
             ),
@@ -634,155 +636,11 @@ def _normalized_response(response: np.ndarray, region: np.ndarray) -> np.ndarray
     return np.clip(response / scale, 0.0, 1.0).astype(np.float32)
 
 
-def detect_great_vessels(
-    image: np.ndarray,
-    renal_mask: np.ndarray,
-    spacing: np.ndarray,
-    midline_index: float,
-    maximum_vessels: int = 2,
-) -> np.ndarray:
-    """Find the aorta/IVC as long, thick, contrast-enhanced tubes near the midline.
-
-    Canonical RAS is assumed (axis 0 left-right, axis 2 cranio-caudal). Structures that
-    are too wide (liver, bowel loops), too short, far from the midline, or wrapped in
-    cortical bone (vertebral bodies) are rejected. This is a research heuristic.
-    """
-
-    spacing = np.asarray(spacing, dtype=float)
-    keep = np.zeros(image.shape, dtype=bool)
-    if image.ndim != 3 or image.shape[2] < 3:
-        return keep
-    near_renal = ndi.binary_dilation(renal_mask, iterations=2)
-    bright = (image >= 100.0) & (image <= 650.0) & ~near_renal
-    if not np.any(bright):
-        return keep
-    # Morphological opening with a ~4 mm ball keeps only thick structures.
-    cores = ndi.distance_transform_edt(bright, sampling=tuple(spacing)) >= 4.0
-    if not np.any(cores):
-        return keep
-    thick = bright & (ndi.distance_transform_edt(~cores, sampling=tuple(spacing)) <= 4.0)
-    labels, count = ndi.label(thick)
-    if count == 0:
-        return keep
-
-    z_extent_total_mm = image.shape[2] * spacing[2]
-    minimum_length_mm = max(40.0, 0.45 * z_extent_total_mm)
-    cortical_bone = image > 700.0
-    ranked = []
-    for component_id, component_slice in enumerate(ndi.find_objects(labels), start=1):
-        if component_slice is None:
-            continue
-        component = labels[component_slice] == component_id
-        occupied_slices = np.flatnonzero(component.any(axis=(0, 1)))
-        length_mm = occupied_slices.size * spacing[2]
-        if length_mm < minimum_length_mm:
-            continue
-        area_per_slice_mm2 = (
-            np.count_nonzero(component) * spacing[0] * spacing[1] / occupied_slices.size
-        )
-        if not 80.0 <= area_per_slice_mm2 <= 1500.0:
-            continue
-        in_plane_mm = min(spacing[0], spacing[1])
-        widest_mm = max(
-            float(np.max(np.ptp(np.argwhere(component[:, :, z]), axis=0) + 1)) * in_plane_mm
-            for z in occupied_slices[:: max(1, occupied_slices.size // 8)]
-        )
-        if widest_mm > 45.0:
-            continue
-        centroid_x = float(np.mean(np.nonzero(component)[0])) + component_slice[0].start
-        if abs(centroid_x - midline_index) * spacing[0] > 60.0:
-            continue
-        padded_slice = tuple(
-            slice(max(0, sl.start - 3), min(dim, sl.stop + 3))
-            for sl, dim in zip(component_slice, image.shape)
-        )
-        local = labels[padded_slice] == component_id
-        shell = ndi.binary_dilation(local, iterations=2) & ~local
-        if np.mean(cortical_bone[padded_slice][shell]) > 0.2:
-            continue
-        ranked.append((length_mm / (1.0 + widest_mm / 30.0), component_id, component_slice))
-
-    for _score, component_id, component_slice in sorted(ranked, reverse=True)[:maximum_vessels]:
-        keep[component_slice] |= labels[component_slice] == component_id
-    return keep
-
-
-def bridge_vessel_gaps(
-    candidates: np.ndarray,
-    image: np.ndarray,
-    anchors: np.ndarray,
-    spacing: np.ndarray,
-    max_gap_mm: float = VESSEL_MAX_GAP_MM,
-    minimum_bridge_hu: float = 60.0,
-    maximum_components: int = 48,
-) -> tuple[np.ndarray, int]:
-    """Join broken vessel fragments with thin straight bridges.
-
-    Each fragment is linked once to its nearest neighbour (another fragment or an
-    aorta/IVC anchor) when the gap is short and the straight path stays in enhancing
-    tissue rather than fat. Returns the bridged mask and the number of bridges.
-    """
-
-    spacing = np.asarray(spacing, dtype=float)
-    combined = candidates | anchors
-    labels, count = ndi.label(combined, structure=np.ones((3, 3, 3), dtype=np.uint8))
-    if count < 2:
-        return candidates, 0
-    sizes = np.bincount(labels.ravel())[1:]
-    kept_ids = np.argsort(sizes)[::-1][:maximum_components] + 1
-    surfaces = combined & ~ndi.binary_erosion(combined)
-    trees = {}
-    points_by_id = {}
-    for component_id in kept_ids:
-        points = np.argwhere(surfaces & (labels == component_id))
-        if points.shape[0] > 4000:
-            points = points[:: points.shape[0] // 4000 + 1]
-        if points.size:
-            points_by_id[int(component_id)] = points
-            trees[int(component_id)] = cKDTree(points * spacing)
-
-    bridged = candidates.copy()
-    bridge_count = 0
-    linked = set()
-    anchor_ids = {int(i) for i in np.unique(labels[anchors]) if i}
-    for component_id, points in points_by_id.items():
-        if component_id in anchor_ids:
-            continue
-        best = None
-        for other_id, tree in trees.items():
-            if other_id == component_id:
-                continue
-            distances, indices = tree.query(points * spacing, k=1)
-            nearest = int(np.argmin(distances))
-            gap = float(distances[nearest])
-            if best is None or gap < best[0]:
-                partner = points_by_id[other_id][int(indices[nearest])]
-                best = (gap, points[nearest], partner, other_id)
-        if best is None or best[0] > max_gap_mm:
-            continue
-        pair = tuple(sorted((component_id, best[3])))
-        if pair in linked:
-            continue
-        start, end = best[1].astype(float), best[2].astype(float)
-        steps = int(np.ceil(np.max(np.abs(end - start)))) + 1
-        path = np.rint(np.linspace(start, end, steps)).astype(int)
-        path_hu = image[tuple(path.T)]
-        if float(np.mean(path_hu)) < minimum_bridge_hu:
-            continue
-        line = np.zeros_like(bridged, dtype=bool)
-        line[tuple(path.T)] = True
-        bridged |= ndi.binary_dilation(line, iterations=1) & ~anchors
-        linked.add(pair)
-        bridge_count += 1
-    return bridged, bridge_count
-
-
 def _filter_vessel_components(
     candidates: np.ndarray,
     distance_from_renal: np.ndarray,
     effective_spacing: np.ndarray,
-    maximum_components: int = 32,
-    distance_from_great: np.ndarray | None = None,
+    maximum_components: int = 24,
 ) -> np.ndarray:
     labels, component_count = ndi.label(
         candidates,
@@ -806,14 +664,11 @@ def _filter_vessel_components(
         minimum_renal_distance = float(
             np.min(distance_from_renal[component_slice][component])
         )
-        attached = minimum_renal_distance <= 8.0
-        if distance_from_great is not None:
-            minimum_great_distance = float(
-                np.min(distance_from_great[component_slice][component])
-            )
-            attached = attached or minimum_great_distance <= 6.0
-            minimum_renal_distance = min(minimum_renal_distance, minimum_great_distance)
-        if volume_mm3 < 10.0 or float(np.max(extent_mm)) < 6.0 or not attached:
+        if (
+            volume_mm3 < 10.0
+            or float(np.max(extent_mm)) < 6.0
+            or minimum_renal_distance > 8.0
+        ):
             continue
         score = volume_mm3 * (1.0 + float(np.max(extent_mm)) / 12.0) / (
             1.0 + minimum_renal_distance
@@ -836,7 +691,7 @@ def candidate_vessel_mesh(
     sensitivity: str = "Balanced",
     detail: str = "Balanced",
 ) -> MeshData | None:
-    """Estimate unlabeled vessels from the kidneys to the aorta/IVC for research display.
+    """Estimate unlabeled tubular structures near kidneys for research visualization.
 
     The response fuses physical-scale Frangi and Sato filters, then applies hysteresis
     connectivity. It intentionally remains an unlabeled candidate layer: it cannot
@@ -862,26 +717,9 @@ def candidate_vessel_mesh(
         coordinates.max(axis=0) + padding_voxels + 1,
         np.asarray(image.shape),
     )
-    # Reach the aorta and IVC: extend the crop across the midline (canonical RAS axis 0).
-    renal_width_mm = float((coordinates[:, 0].max() - coordinates[:, 0].min()) * spacing_array[0])
-    midline_index = (
-        float(coordinates[:, 0].min() + coordinates[:, 0].max()) / 2.0
-        if renal_width_mm >= 100.0
-        else (image.shape[0] - 1) / 2.0
-    )
-    midline_half_width = int(np.ceil(GREAT_VESSEL_MIDLINE_MM / spacing_array[0]))
-    minimum[0] = max(0, min(int(minimum[0]), int(midline_index) - midline_half_width))
-    maximum[0] = min(
-        image.shape[0],
-        max(int(maximum[0]), int(np.ceil(midline_index)) + midline_half_width + 1),
-    )
     slices = tuple(slice(int(lo), int(hi)) for lo, hi in zip(minimum, maximum))
     image_crop = image[slices]
     renal_crop = renal_mask[slices]
-    labeled_great_crop = np.isin(
-        segmentation[slices],
-        (int(CanonicalLabel.AORTA), int(CanonicalLabel.IVC)),
-    )
 
     target_spacing = VESSEL_TARGET_SPACING_MM.get(detail, 1.5)
     output_shape = _output_shape_for_spacing(
@@ -905,40 +743,11 @@ def candidate_vessel_mesh(
         ~renal_small,
         sampling=tuple(effective_spacing),
     )
-    great_source = "none"
-    if np.any(labeled_great_crop):
-        great_small = _resample(
-            labeled_great_crop.astype(np.uint8), output_shape, order=0
-        )[0].astype(bool)
-        great_source = "labels"
-    else:
-        great_small = detect_great_vessels(
-            image_small,
-            renal_small,
-            effective_spacing,
-            (midline_index - float(minimum[0])) / float(input_per_output[0]),
-        )
-        if np.any(great_small):
-            great_source = "detected"
     region = distance_from_renal <= 24.0
-    distance_from_great = None
-    if np.any(great_small):
-        distance_from_great = ndi.distance_transform_edt(
-            ~great_small,
-            sampling=tuple(effective_spacing),
-        )
-        renal_to_great_mm = float(np.min(distance_from_renal[great_small]))
-        # An elliptical corridor between the kidney and the great vessels: the hilum,
-        # main renal artery and renal vein all lie inside it.
-        region |= distance_from_great <= 12.0
-        region |= (
-            distance_from_renal + distance_from_great
-            <= renal_to_great_mm + VESSEL_CORRIDOR_SLACK_MM
-        )
 
     clipped = np.clip(image_small, -50.0, 500.0)
     normalized = ((clipped + 50.0) / 550.0).astype(np.float32)
-    physical_sigmas_mm = np.asarray(VESSEL_SIGMAS_MM)
+    physical_sigmas_mm = np.asarray((0.8, 1.2, 1.8, 2.6, 3.5))
     sigma_pixels = tuple(
         float(max(0.5, sigma / float(np.mean(effective_spacing))))
         for sigma in physical_sigmas_mm
@@ -955,9 +764,6 @@ def candidate_vessel_mesh(
     )
 
     enhanced_tissue = region & (image_small >= 80.0) & (image_small <= 650.0)
-    if np.any(great_small):
-        # Thresholds are learned on branch vessels; the large trunks are added back below.
-        enhanced_tissue &= ~ndi.binary_dilation(great_small, iterations=1)
     fused = np.maximum(
         _normalized_response(frangi_response, enhanced_tissue),
         0.85 * _normalized_response(sato_response, enhanced_tissue),
@@ -985,21 +791,11 @@ def candidate_vessel_mesh(
         candidates,
         min_size=minimum_component_voxels,
     )
-    candidates, bridges_added = bridge_vessel_gaps(
-        candidates,
-        image_small,
-        great_small,
-        effective_spacing,
-    )
     candidates = _filter_vessel_components(
         candidates,
         distance_from_renal,
         effective_spacing,
-        distance_from_great=distance_from_great,
     )
-    if great_source == "detected":
-        # Detected trunks are drawn in this layer; labeled ones already have their own mesh.
-        candidates = candidates | great_small
     if not np.any(candidates):
         return None
 
@@ -1056,7 +852,7 @@ def candidate_vessel_mesh(
             source_volume_mm3,
             smoothing_p95,
             float(np.mean(effective_spacing)),
-            "Frangi/Sato fusion, hysteresis, gap bridging, aorta/IVC anchoring",
+            "Physical-scale Frangi/Sato fusion + connectivity hysteresis",
         ),
     }
     mesh["quality"].update(
@@ -1066,8 +862,6 @@ def candidate_vessel_mesh(
             "high_vesselness_threshold": high_threshold,
             "low_vesselness_threshold": low_threshold,
             "calibrated_iso_level_mm": iso_level,
-            "great_vessels": great_source,
-            "gap_bridges_added": int(bridges_added),
         }
     )
     return mesh

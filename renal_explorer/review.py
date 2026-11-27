@@ -26,6 +26,7 @@ from typing import Any
 import numpy as np
 
 QA_PENDING, QA_PASSED, QA_FAILED = "pending", "passed", "failed"
+QA_INCOMPLETE = "incomplete"  # a required metric or expected structure is missing
 UNREVIEWED, REVIEWED, ACCEPTED, REJECTED = "unreviewed", "reviewed", "accepted", "rejected"
 CLINICIAN_STATES = (UNREVIEWED, REVIEWED, ACCEPTED, REJECTED)
 
@@ -36,7 +37,36 @@ STATE_LABELS = {
     ACCEPTED: "Accepted for research analysis",
     REJECTED: "Rejected by clinician",
     QA_FAILED: "Automated QA failed",
+    QA_INCOMPLETE: "Automated QA incomplete: missing evidence",
 }
+
+# Bump when planning/measurement logic changes in a way that invalidates earlier reviews.
+PLANNING_ALGORITHM_VERSION = "2026.11-exact-gap"
+
+
+def lesion_review_key(
+    ct_digest: str | None,
+    segmentation_token: str,
+    tumor_center_mm,
+    margin_mm: float,
+    branch_depth: int,
+) -> str:
+    """Key for a lesion-specific plan review.
+
+    Bound to the inputs (CT and label hashes, grid), the lesion (its world-space centre,
+    rounded to 1 mm, so it does not depend on list order), the plan parameters and the
+    planning algorithm version. Changing any of them starts a new, unreviewed record.
+    """
+
+    lesion = ",".join(f"{float(value):.0f}" for value in tumor_center_mm)
+    return review_case_key(
+        ct_digest,
+        segmentation_token,
+        f"lesion@{lesion}",
+        f"margin={float(margin_mm):g}",
+        f"branch_depth={int(branch_depth)}",
+        PLANNING_ALGORITHM_VERSION,
+    )
 
 REVIEW_CHECKS = {
     "kidney_contour": "Kidney contour matches the CT",
@@ -62,15 +92,26 @@ def review_case_key(*parts: Any) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:24]
 
 
+REQUIRED_QUALITY_METRICS = ("watertight", "volume_error_pct", "surface_to_mask_p95_mm")
+
+
 def automated_qa(
     meshes: dict[str, dict[str, Any] | None],
     spacing: tuple[float, float, float] | list[float],
     reduced_resolution: bool = False,
+    expected: tuple[str, ...] | list[str] = (),
 ) -> dict[str, Any]:
-    """Geometry and integrity checks on the reference meshes of one plan."""
+    """Geometry and integrity checks on the reference meshes of one plan.
+
+    Missing evidence never passes: an expected structure without a mesh fails, and a
+    mesh without one of ``REQUIRED_QUALITY_METRICS`` makes the result ``incomplete``.
+    """
 
     checks: list[dict[str, Any]] = []
     surface_limit = QA_SURFACE_TO_MASK_FACTOR * float(max(spacing))
+    meshes = dict(meshes)
+    for name in expected:
+        meshes.setdefault(name, None)
     for name, mesh in meshes.items():
         if mesh is None or len(mesh.get("faces", [])) == 0:
             checks.append(
@@ -82,7 +123,17 @@ def automated_qa(
                 }
             )
             continue
-        quality = mesh.get("quality", {})
+        quality = mesh.get("quality") or {}
+        missing = [key for key in REQUIRED_QUALITY_METRICS if quality.get(key) is None]
+        if missing:
+            checks.append(
+                {
+                    "structure": name,
+                    "check": "required metrics present",
+                    "passed": None,
+                    "detail": "missing: " + ", ".join(missing),
+                }
+            )
         vertices = mesh["vertices"]
         finite = bool(np.all(np.isfinite(vertices)))
         checks.append(
@@ -93,24 +144,26 @@ def automated_qa(
                 "detail": "" if finite else "NaN or infinite vertex",
             }
         )
-        watertight = bool(quality.get("watertight", True))
-        checks.append(
-            {
-                "structure": name,
-                "check": "closed surface",
-                "passed": watertight,
-                "detail": "" if watertight else "surface has holes",
-            }
-        )
-        error = float(quality.get("volume_error_pct", 0.0))
-        checks.append(
-            {
-                "structure": name,
-                "check": f"mesh vs mask volume within {QA_MAX_VOLUME_ERROR_PCT:.0f} %",
-                "passed": error <= QA_MAX_VOLUME_ERROR_PCT,
-                "detail": f"{error:.2f} %",
-            }
-        )
+        if quality.get("watertight") is not None:
+            watertight = bool(quality["watertight"])
+            checks.append(
+                {
+                    "structure": name,
+                    "check": "closed surface",
+                    "passed": watertight,
+                    "detail": "" if watertight else "surface has holes",
+                }
+            )
+        if quality.get("volume_error_pct") is not None:
+            error = abs(float(quality["volume_error_pct"]))
+            checks.append(
+                {
+                    "structure": name,
+                    "check": f"mesh vs mask volume within {QA_MAX_VOLUME_ERROR_PCT:.0f} %",
+                    "passed": error <= QA_MAX_VOLUME_ERROR_PCT,
+                    "detail": f"{error:.2f} %",
+                }
+            )
         if quality.get("surface_to_mask_p95_mm") is not None:
             departure = float(quality["surface_to_mask_p95_mm"])
             checks.append(
@@ -123,8 +176,12 @@ def automated_qa(
             )
     if not checks:
         status = QA_PENDING
+    elif any(item["passed"] is False for item in checks):
+        status = QA_FAILED
+    elif any(item["passed"] is None for item in checks):
+        status = QA_INCOMPLETE
     else:
-        status = QA_PASSED if all(item["passed"] for item in checks) else QA_FAILED
+        status = QA_PASSED
     warnings = []
     if reduced_resolution:
         warnings.append("Demo resolution: geometry is approximate.")
@@ -167,12 +224,14 @@ def overall_state(qa_status: str, record: ReviewRecord | None) -> str:
     status = record.status if record else UNREVIEWED
     if status == REJECTED:
         return REJECTED
+    # A failed or incomplete geometry check is always shown, even over a clinician
+    # review: the review's checks remain in the record, but the state is not "accepted".
+    if qa_status in (QA_FAILED, QA_INCOMPLETE):
+        return qa_status
     if status == ACCEPTED and qa_status == QA_PASSED:
         return ACCEPTED
     if status in (REVIEWED, ACCEPTED):
         return REVIEWED
-    if qa_status == QA_FAILED:
-        return QA_FAILED
     if qa_status == QA_PASSED:
         return QA_PASSED
     return "generated"
